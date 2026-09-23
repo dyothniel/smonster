@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="fr">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>smonster — profils</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <header>
+      <h1>Profils</h1>
+      <button class="primary" id="newProfileBtn">+ Nouveau profil</button>
+    </header>
+
+    <main>
+      <div id="bulkToolbar">
+        <span class="count" id="bulkCount"></span>
+        <button id="bulkLaunch">Lancer</button>
+        <button id="bulkStop">Stopper</button>
+        <button id="bulkClearCache">Vider le cache</button>
+        <button id="bulkSetProxy">Config proxy</button>
+        <button class="danger" id="bulkDelete">Supprimer</button>
+        <button id="bulkClearSelection">Désélectionner</button>
+      </div>
+
+      <div id="profileGrid"></div>
+    </main>
+
+    <!-- Nouveau profil -->
+    <div class="modal-backdrop" id="newProfileModal">
+      <div class="modal">
+        <h2>Nouveau profil</h2>
+        <form id="newProfileForm">
+          <div class="field">
+            <label for="npName">Nom</label>
+            <input type="text" id="npName" required autocomplete="off" />
+          </div>
+          <div class="field field-inline">
+            <div id="npHeadlessContainer"></div>
+            <label style="margin: 0">Headless</label>
+          </div>
+          <div class="field">
+            <label>Device</label>
+            <div id="npDeviceContainer"></div>
+          </div>
+          <details class="advanced">
+            <summary>Options avancées (proxy, locale, fuseau)</summary>
+            <div class="field">
+              <label for="npProxyServer">Proxy — serveur (ex. http://host:port)</label>
+              <input type="text" id="npProxyServer" autocomplete="off" />
+            </div>
+            <div class="field">
+              <label for="npProxyUser">Proxy — utilisateur</label>
+              <input type="text" id="npProxyUser" autocomplete="off" />
+            </div>
+            <div class="field">
+              <label for="npProxyPass">Proxy — mot de passe</label>
+              <input type="text" id="npProxyPass" autocomplete="off" />
+            </div>
+            <div class="field">
+              <label for="npProxyRotation">Proxy — lien de rotation (optionnel)</label>
+              <input type="text" id="npProxyRotation" placeholder="https://..." autocomplete="off" />
+            </div>
+            <div class="field">
+              <label>Locale</label>
+              <div id="npLocaleContainer"></div>
+            </div>
+            <div class="field">
+              <label>Fuseau horaire</label>
+              <div id="npTzContainer"></div>
+            </div>
+          </details>
+          <div class="modal-actions">
+            <button type="button" id="npCancel">Annuler</button>
+            <button type="submit" class="primary">Créer</button>
+          </div>
+        </form>
+      </div>
+    </div>
+
+    <!-- Config proxy groupée -->
+    <div class="modal-backdrop" id="proxyModal">
+      <div class="modal">
+        <h2>Configurer le proxy</h2>
+        <p class="mono" id="proxyModalTarget" style="color: var(--text-dim)"></p>
+        <form id="proxyForm">
+          <div class="field">
+            <label for="pxServer">Serveur (laisser vide pour retirer le proxy)</label>
+            <input type="text" id="pxServer" placeholder="http://host:port" autocomplete="off" />
+          </div>
+          <div class="field">
+            <label for="pxUser">Utilisateur</label>
+            <input type="text" id="pxUser" autocomplete="off" />
+          </div>
+          <div class="field">
+            <label for="pxPass">Mot de passe</label>
+            <input type="text" id="pxPass" autocomplete="off" />
+          </div>
+          <div class="field">
+            <label for="pxRotation">Lien de rotation (optionnel)</label>
+            <input type="text" id="pxRotation" placeholder="https://..." autocomplete="off" />
+          </div>
+          <div class="modal-actions">
+            <button type="button" id="pxCancel">Annuler</button>
+            <button type="submit" class="primary">Appliquer</button>
+          </div>
+        </form>
+      </div>
+    </div>
+
+    <div id="contextMenu"></div>
+    <div id="toasts"></div>
+
+    <script src="shared.js"></script>
+    <script src="widgets.js"></script>
+    <script src="app.js"></script>
+  </body>
+</html>

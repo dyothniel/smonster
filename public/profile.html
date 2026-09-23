@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="fr">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>smonster — réglages du profil</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <header>
+      <div>
+        <a class="back-link" href="index.html">&larr; Retour aux profils</a>
+        <h1 id="pageTitle" style="margin-top: 6px">Réglages</h1>
+      </div>
+      <div class="tile-actions" style="display: flex; gap: 8px">
+        <button id="toggleBtn">…</button>
+        <button class="danger" id="deleteBtn">Supprimer</button>
+      </div>
+    </header>
+
+    <main style="max-width: 640px">
+      <div class="tile-meta" id="statusBadges" style="margin-bottom: 16px"></div>
+      <p id="runningNotice" style="display: none; color: var(--yellow); font-size: 13px">
+        Ce profil est actif : les changements ci-dessous ne s'appliqueront qu'au prochain lancement.
+      </p>
+
+      <form id="settingsForm">
+        <div class="field">
+          <label for="fName">Nom</label>
+          <input type="text" id="fName" required autocomplete="off" />
+        </div>
+
+        <div class="field">
+          <label>Dossier du profil</label>
+          <p class="mono" id="folderPath"></p>
+        </div>
+
+        <div class="field">
+          <label>Cache</label>
+          <p id="cacheInfo" class="mono"></p>
+          <button type="button" id="clearCacheBtn">Vider le cache</button>
+        </div>
+
+        <div class="field field-inline">
+          <div id="fHeadlessContainer"></div>
+          <label style="margin: 0">Headless</label>
+        </div>
+
+        <div class="field">
+          <label>Device</label>
+          <div id="fDeviceContainer"></div>
+        </div>
+
+        <div class="field">
+          <label>Locale</label>
+          <div id="fLocaleContainer"></div>
+        </div>
+
+        <div class="field">
+          <label>Fuseau horaire</label>
+          <div id="fTzContainer"></div>
+        </div>
+
+        <div class="field">
+          <label for="fProxyServer">Proxy — serveur (vide = pas de proxy)</label>
+          <input type="text" id="fProxyServer" placeholder="http://host:port" autocomplete="off" />
+        </div>
+        <div class="field">
+          <label for="fProxyUser">Proxy — utilisateur</label>
+          <input type="text" id="fProxyUser" autocomplete="off" />
+        </div>
+        <div class="field">
+          <label for="fProxyPass">Proxy — mot de passe</label>
+          <input type="text" id="fProxyPass" autocomplete="off" />
+        </div>
+        <div class="field">
+          <label for="fProxyRotation">Proxy — lien de rotation (optionnel)</label>
+          <input type="text" id="fProxyRotation" placeholder="https://..." autocomplete="off" />
+        </div>
+
+        <div class="modal-actions" style="justify-content: flex-start">
+          <button type="submit" class="primary">Enregistrer</button>
+        </div>
+      </form>
+    </main>
+
+    <div id="contextMenu"></div>
+    <div id="toasts"></div>
+
+    <script src="shared.js"></script>
+    <script src="widgets.js"></script>
+    <script src="profile.js"></script>
+  </body>
+</html>

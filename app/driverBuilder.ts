@@ -10,8 +10,88 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import { randomUUID } from 'crypto';
+import type { ProxyRotator } from './proxyRotator';
 
 type Engine = 'chromium' | 'webkit';
+
+/**
+ * Dérive un seed 32 bits stable à partir d'une chaîne (ici, `profileDir`). Même profil (même
+ * dossier, y compris relancé plus tard) → même seed → même bruit de canvas ; profil différent →
+ * seed différente. Simple hash déterministe (djb2-like), pas besoin de cryptographique ici.
+ */
+export function hashToSeed(str: string): number {
+  let hash = 0;
+  for (let i = 0; i < str.length; i++) {
+    hash = (Math.imul(31, hash) + str.charCodeAt(i)) | 0;
+  }
+  return hash >>> 0;
+}
+
+/**
+ * Ajoute un bruit imperceptible mais déterministe (fonction de `seed` et de la position du
+ * pixel, jamais d'un compteur d'appel) aux lectures de canvas 2D (`getImageData`, `toDataURL`,
+ * `toBlob`) : deux profils avec le même device/proxy/timezone ressortent quand même avec un
+ * fingerprint canvas différent, alors qu'un même profil relancé plusieurs fois garde TOUJOURS le
+ * même fingerprint — un vrai utilisateur a un rendu canvas stable dans le temps sur sa machine ;
+ * un bruit qui changerait à chaque appel serait lui-même un signal de détection.
+ *
+ * Fonction top-level pure (aucune closure sur des variables Node) : son code source est
+ * sérialisé tel quel par Playwright pour tourner dans la page via `context.addInitScript`.
+ */
+function applyCanvasNoise(seed: number): void {
+  function pixelNoise(index: number): number {
+    let h = (seed ^ index) >>> 0;
+    h = Math.imul(h ^ (h >>> 16), 0x45d9f3b);
+    h = Math.imul(h ^ (h >>> 16), 0x45d9f3b);
+    h = (h ^ (h >>> 16)) >>> 0;
+    return (h % 3) - 1; // -1, 0 ou 1
+  }
+  function clamp(v: number): number {
+    return v < 0 ? 0 : v > 255 ? 255 : v;
+  }
+  function noiseImageData(imageData: ImageData): ImageData {
+    const data = imageData.data;
+    for (let i = 0; i < data.length; i += 4) {
+      data[i] = clamp(data[i] + pixelNoise(i));
+      data[i + 1] = clamp(data[i + 1] + pixelNoise(i + 1));
+      data[i + 2] = clamp(data[i + 2] + pixelNoise(i + 2));
+      // canal alpha (i + 3) intact : le bruit ne doit toucher que la couleur.
+    }
+    return imageData;
+  }
+
+  const origGetImageData = CanvasRenderingContext2D.prototype.getImageData;
+  CanvasRenderingContext2D.prototype.getImageData = function (
+    this: CanvasRenderingContext2D,
+    ...args: Parameters<typeof origGetImageData>
+  ) {
+    return noiseImageData(origGetImageData.apply(this, args));
+  };
+
+  // `toDataURL`/`toBlob` ne passent pas forcément par `getImageData` en interne : on les fait
+  // exporter depuis un clone bruité plutôt que le canvas d'origine, pour rester cohérent avec ce
+  // que `getImageData` renverrait sur ce même contenu.
+  function noisyClone(canvas: HTMLCanvasElement): HTMLCanvasElement {
+    const clone = document.createElement('canvas');
+    clone.width = canvas.width;
+    clone.height = canvas.height;
+    const ctx = clone.getContext('2d')!;
+    ctx.drawImage(canvas, 0, 0);
+    const imageData = noiseImageData(origGetImageData.call(ctx, 0, 0, clone.width, clone.height));
+    ctx.putImageData(imageData, 0, 0);
+    return clone;
+  }
+
+  const origToDataURL = HTMLCanvasElement.prototype.toDataURL;
+  HTMLCanvasElement.prototype.toDataURL = function (this: HTMLCanvasElement, ...args: unknown[]) {
+    return (origToDataURL as (...a: unknown[]) => string).apply(noisyClone(this), args);
+  };
+
+  const origToBlob = HTMLCanvasElement.prototype.toBlob;
+  HTMLCanvasElement.prototype.toBlob = function (this: HTMLCanvasElement, ...args: unknown[]) {
+    return (origToBlob as (...a: unknown[]) => void).apply(noisyClone(this), args);
+  };
+}
 
 /**
  * Détermine le moteur (`chromium` ou `webkit`) à utiliser pour un `device` donné, sans rien
@@ -90,17 +170,50 @@ export interface ProxyConfig {
   bypass?: string;
   username?: string;
   password?: string;
+  /**
+   * URL de rotation optionnelle proposée par certains fournisseurs de proxy résidentiels/
+   * rotatifs : appeler cette URL déclenche un changement d'IP de sortie côté fournisseur, sans
+   * changer `server`. Purement informatif pour l'instant — DriverBuilder ne l'appelle jamais
+   * lui-même (aucun appel HTTP automatique), c'est juste transporté avec le reste de la config
+   * pour que l'appelant puisse s'en servir (bouton manuel, appel avant lancement, etc.) s'il le
+   * souhaite.
+   */
+  rotationUrl?: string;
 }
 
 export interface DriverBuilderOptions {
   baseProfileDir?: string;
   headless?: boolean;
+  /** Proxy fixe pour toutes les tentatives. Mutuellement exclusif avec `proxyRotator`. */
   proxy?: ProxyConfig;
+  /**
+   * Source de proxies avec rotation/exclusion (cf. proxyRotator.ts). À chaque tentative de
+   * `build()`, un proxy est demandé via `proxyRotator.next(proxyStickyKey)` ; un échec de
+   * cette tentative est rapporté au rotator avant de retenter avec un autre proxy. Mutuellement
+   * exclusif avec `proxy`.
+   */
+  proxyRotator?: ProxyRotator;
+  /**
+   * Clé de stickiness transmise à `proxyRotator.next()` : deux `DriverBuilder` avec la même
+   * clé se voient assigner le même proxy tant qu'il reste disponible (utile pour garder une IP
+   * stable sur un slot de `DriverPool` malgré le recyclage des profils). Ignoré sans
+   * `proxyRotator`.
+   */
+  proxyStickyKey?: string;
   keepProfile?: boolean;
   maxRetries?: number;
   device?: keyof typeof playwrightDevices | 'desktop';
   locale?: string;
   timezoneId?: string;
+  /**
+   * Chemin fixe pour un profil nommé et persistant (ex. géré par un `ProfileManager`), à la
+   * place d'un dossier éphémère généré aléatoirement sous `baseProfileDir`. Si fourni, ce
+   * dossier n'est JAMAIS supprimé automatiquement — ni par le nettoyage sur échec de tentative
+   * dans `build()`, ni par `quit()` — quelle que soit la valeur de `keepProfile` : les
+   * cookies/données d'un profil nommé doivent survivre à un simple hoquet de lancement ou à une
+   * fermeture normale. C'est à l'appelant de le supprimer explicitement s'il veut s'en défaire.
+   */
+  profileDir?: string;
 }
 
 export interface BuiltDriver {
@@ -108,6 +221,16 @@ export interface BuiltDriver {
   context: BrowserContext;
   page: Page;
   profileDir: string;
+  /**
+   * Le proxy effectivement utilisé pour ce driver (statique ou pioché via `proxyRotator`),
+   * `undefined` si aucun. Exposé pour que l'appelant puisse rapporter un échec au rotator
+   * après coup : `healthCheck()` ne navigue que vers `about:blank` (jamais proxifié), donc un
+   * proxy injoignable ou mal configuré n'est PAS détecté par `build()` lui-même — vérifié
+   * empiriquement, Chromium démarre sans broncher avec un `proxy.server` invalide. C'est à
+   * l'appelant, s'il constate l'échec (ex. un `page.goto()` réel qui time out), de faire
+   * `proxyRotator.reportFailure(driver.proxy)`.
+   */
+  proxy?: ProxyConfig;
 }
 
 // Associe chaque contexte persistant au dossier de profil à supprimer dans quit(),
@@ -147,8 +270,11 @@ async function getHeadlessDesktopUserAgent(): Promise<string> {
 
 export class DriverBuilder {
   private baseProfileDir: string;
+  private fixedProfileDir?: string;
   private headless: boolean;
   private proxy?: ProxyConfig;
+  private proxyRotator?: ProxyRotator;
+  private proxyStickyKey?: string;
   private keepProfile: boolean;
   private maxRetries: number;
   private device: NonNullable<DriverBuilderOptions['device']>;
@@ -156,23 +282,43 @@ export class DriverBuilder {
   private timezoneId: string;
 
   constructor(opts: DriverBuilderOptions = {}) {
+    if (opts.proxy && opts.proxyRotator) {
+      throw new Error('DriverBuilderOptions: `proxy` et `proxyRotator` sont mutuellement exclusifs.');
+    }
+    this.fixedProfileDir = opts.profileDir;
     this.baseProfileDir = opts.baseProfileDir ?? path.join(os.tmpdir(), 'browser-profiles');
     this.headless = opts.headless ?? false;
     this.proxy = opts.proxy;
+    this.proxyRotator = opts.proxyRotator;
+    this.proxyStickyKey = opts.proxyStickyKey;
     this.keepProfile = opts.keepProfile ?? false;
     this.maxRetries = opts.maxRetries ?? 3;
     this.device = opts.device ?? 'desktop';
     this.locale = opts.locale ?? 'fr-FR';
     this.timezoneId = opts.timezoneId ?? 'Europe/Paris';
 
-    fs.mkdirSync(this.baseProfileDir, { recursive: true });
+    // Inutile de préparer un dossier de base éphémère si on ne s'en servira jamais (chemin
+    // fixe fourni).
+    if (!this.fixedProfileDir) {
+      fs.mkdirSync(this.baseProfileDir, { recursive: true });
+    }
   }
 
-  private newProfileDir(): string {
+  /**
+   * Résout le dossier de profil à utiliser pour une tentative de `build()`. `ephemeral: false`
+   * signifie « ne jamais supprimer ce dossier automatiquement » (cf. doc de `profileDir` sur
+   * `DriverBuilderOptions`) : c'est ce flag qui protège un profil nommé persistant du nettoyage
+   * sur échec de tentative et du nettoyage dans `quit()`.
+   */
+  private resolveProfileDir(): { dir: string; ephemeral: boolean } {
+    if (this.fixedProfileDir) {
+      fs.mkdirSync(this.fixedProfileDir, { recursive: true });
+      return { dir: this.fixedProfileDir, ephemeral: false };
+    }
     const sessionId = randomUUID().slice(0, 12);
     const dir = path.join(this.baseProfileDir, `profile-${sessionId}`);
     fs.mkdirSync(dir, { recursive: false });
-    return dir;
+    return { dir, ephemeral: true };
   }
 
   private async pickDeviceConfig() {
@@ -202,10 +348,19 @@ export class DriverBuilder {
     let lastErr: unknown;
 
     for (let attempt = 1; attempt <= this.maxRetries; attempt++) {
-      const profileDir = this.newProfileDir();
+      const { dir: profileDir, ephemeral } = this.resolveProfileDir();
+      // Déclarés ici (et pas juste résolus/créés inline plus bas) pour que le `catch` puisse y
+      // accéder : `proxy`, pour rapporter l'échec au rotator (reste `undefined` si l'erreur
+      // survient avant sa résolution, ex. un device inconnu — pas question d'incriminer un proxy
+      // pour une erreur qui lui est étrangère) ; `context`, pour le fermer si le lancement a
+      // réussi mais qu'une étape *suivante* (healthCheck...) a échoué — sinon ce navigateur déjà
+      // lancé fuit indéfiniment (process orphelin), qu'on retente ensuite ou qu'on abandonne.
+      let proxy: ProxyConfig | undefined;
+      let context: BrowserContext | undefined;
       try {
         const { engine, ...deviceConfig } = await this.pickDeviceConfig();
         const launcher = engine === 'webkit' ? webkit : chromium;
+        proxy = this.proxyRotator ? this.proxyRotator.next(this.proxyStickyKey) : this.proxy;
 
         // Les flags `--no-sandbox` / `--disable-blink-features=...` sont spécifiques à
         // Chromium (sandboxing et flags Blink) : inutiles sur WebKit, et leur effet sur ce
@@ -225,26 +380,29 @@ export class DriverBuilder {
             : {};
 
         // launchPersistentContext = profil isolé sur disque, comme --user-data-dir
-        const context = await launcher.launchPersistentContext(profileDir, {
+        context = await launcher.launchPersistentContext(profileDir, {
           headless: this.headless,
           locale: this.locale,
           timezoneId: this.timezoneId,
-          ...(this.proxy ? { proxy: this.proxy } : {}),
+          ...(proxy ? { proxy } : {}),
           ...deviceConfig,
           ...engineArgs,
         });
 
-        if (engine === 'webkit') {
-          // Partie JS de l'évasion `navigator.webdriver` du plugin stealth, appliquée à la
-          // main : on évite sa partie `beforeLaunch` (flag CLI Chromium, cf. commentaire plus
-          // haut) mais on garde le nettoyage de la propriété si jamais WebKit l'expose.
-          await context.addInitScript(() => {
-            const proto = Object.getPrototypeOf(navigator);
-            if (proto.webdriver === true) {
-              delete proto.webdriver;
-            }
-          });
-        }
+        // Bruit de canvas déterministe par profil (cf. doc de `applyCanvasNoise`) : seedé sur
+        // `profileDir`, donc stable pour CE profil (même fingerprint à chaque relance d'un
+        // profil nommé) mais différent d'un profil à l'autre, même device/proxy/timezone
+        // identiques. S'applique aux deux moteurs, avant même la création de la page.
+        await context.addInitScript(applyCanvasNoise, hashToSeed(profileDir));
+
+        // Pas de `context.addInitScript(hideWebdriver)` ici pour webkit, volontairement : vérifié
+        // empiriquement sur webkit-2359 (build de repli non officiel pour cette distribution),
+        // supprimer `navigator.webdriver` UNE DEUXIÈME fois (une fois via un script d'init, une
+        // fois via l'évaluation directe de `healthCheck`) corrompt le getter natif — un accès
+        // suivant lève `TypeError: The Navigator.webdriver getter can only be used on instances
+        // of Navigator`, reproductible aussi bien sur un device mobile (iPhone) que desktop
+        // (Desktop Safari). Une seule tentative de suppression, faite dans `healthCheck` juste
+        // avant la lecture, est fiable ; en faire une deuxième ne l'est pas.
 
         // On force le passage par `context.newPage()` plutôt que de réutiliser l'onglet
         // vierge auto-ouvert par certains moteurs (Chromium) sur `launchPersistentContext` :
@@ -263,7 +421,11 @@ export class DriverBuilder {
 
         await this.healthCheck(page);
 
-        if (!this.keepProfile) {
+        if (this.proxyRotator && proxy) {
+          this.proxyRotator.reportSuccess(proxy);
+        }
+
+        if (ephemeral && !this.keepProfile) {
           profileDirsToClean.set(context, profileDir);
         }
 
@@ -277,11 +439,27 @@ export class DriverBuilder {
           context,
           page,
           profileDir,
+          proxy,
         };
       } catch (err) {
         lastErr = err;
+        if (this.proxyRotator && proxy) {
+          this.proxyRotator.reportFailure(proxy);
+        }
         console.warn(`Échec tentative ${attempt}/${this.maxRetries}:`, err);
-        fs.rmSync(profileDir, { recursive: true, force: true });
+        // Le lancement a pu réussir alors qu'une étape suivante (healthCheck...) a échoué : sans
+        // ça, ce navigateur déjà démarré fuit indéfiniment (process orphelin) à chaque tentative
+        // ratée. `.catch()` ici : `close()` peut lui-même échouer (process déjà mort...), ça ne
+        // doit jamais empêcher de continuer vers la tentative suivante.
+        if (context) {
+          await context.close().catch(() => {});
+        }
+        // Un dossier éphémère raté est sans contenu utile : safe à nuker avant de retenter. Un
+        // profil à chemin fixe peut déjà contenir de vraies données (cookies/localStorage d'un
+        // lancement précédent) : un hoquet de lancement ne doit jamais les effacer.
+        if (ephemeral) {
+          fs.rmSync(profileDir, { recursive: true, force: true });
+        }
         await this.sleep(1500 * attempt);
       }
     }
@@ -291,7 +469,39 @@ export class DriverBuilder {
 
   private async healthCheck(page: Page): Promise<void> {
     await page.goto('about:blank');
-    const isWebdriver = await page.evaluate(() => navigator.webdriver);
+    // Une navigation vers `about:blank` ne redéclenche pas de façon fiable les scripts d'init
+    // enregistrés au niveau du contexte sur certains moteurs/versions, donc `navigator.webdriver`
+    // doit être neutralisé ici, directement dans le document courant.
+    //
+    // Cause racine d'un bug qu'on a mis du temps à cerner : lire OU écrire cette propriété via
+    // `Object.getPrototypeOf(navigator).webdriver` invoque le getter natif avec `this` lié au
+    // PROTOTYPE (`Navigator.prototype`) et non à l'instance `navigator` — un receiver invalide.
+    // Sur des getters avec vérification de type stricte, ça lève `TypeError: Illegal invocation`
+    // (Chromium) ou `... can only be used on instances of Navigator` (WebKit, notamment le build
+    // de repli non officiel pour cette distribution — cf. l'avertissement « your OS is not
+    // officially supported » de Playwright à l'installation). Solution : ne JAMAIS invoquer ce
+    // getter via `proto`, seulement via `navigator` (le bon receiver) — pour la LECTURE comme
+    // pour le TEST qui décide s'il faut redéfinir la propriété. Une fois redéfinie avec un getter
+    // neutre (`() => false`, qui ignore `this`), plus aucun risque de ce côté-là.
+    let isWebdriver: unknown;
+    try {
+      isWebdriver = await page.evaluate(() => {
+        if (navigator.webdriver === true) {
+          Object.defineProperty(Object.getPrototypeOf(navigator), 'webdriver', {
+            get: () => false,
+            configurable: true,
+            enumerable: true,
+          });
+        }
+        return navigator.webdriver;
+      });
+    } catch (err) {
+      throw new Error(
+        `Impossible de vérifier/neutraliser navigator.webdriver — profil non furtif : ${
+          err instanceof Error ? err.message : String(err)
+        }`
+      );
+    }
     if (isWebdriver) {
       throw new Error('navigator.webdriver détecté à true — profil non furtif');
     }

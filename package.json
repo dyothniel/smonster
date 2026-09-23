@@ -7,18 +7,21 @@
     "build": "tsc -p tsconfig.json",
     "playwright:install": "playwright install chromium",
     "smoketest": "npm run build && node dist/smoketest.js",
-    "test": "npm run build && node --test dist"
+    "test": "npm run build && node --test dist",
+    "start": "npm run build && node dist/server/index.js"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "description": "",
   "dependencies": {
+    "express": "^5.2.1",
     "playwright": "^1.63.0",
     "playwright-extra": "^4.3.6",
     "puppeteer-extra-plugin-stealth": "^2.11.2"
   },
   "devDependencies": {
+    "@types/express": "^5.0.6",
     "@types/node": "^26.6.2",
     "typescript": "^5.9.3"
   }

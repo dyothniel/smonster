@@ -1,0 +1,585 @@
+:root {
+  --bg: #0f1115;
+  --panel: #171a21;
+  --panel-hover: #1f232c;
+  --border: #2a2f3a;
+  --text: #e6e8eb;
+  --text-dim: #9aa1ac;
+  --accent: #4f8cff;
+  --accent-dim: #2a4a8a;
+  --green: #3ecf8e;
+  --red: #ef5a5a;
+  --yellow: #e0b34d;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+}
+
+header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 24px;
+  border-bottom: 1px solid var(--border);
+}
+
+header h1 {
+  font-size: 18px;
+  margin: 0;
+}
+
+button {
+  font: inherit;
+  cursor: pointer;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--text);
+  border-radius: 6px;
+  padding: 8px 14px;
+  transition: background-color 0.12s ease, border-color 0.12s ease, box-shadow 0.12s ease;
+}
+
+button:hover {
+  background: var(--panel-hover);
+}
+
+button:focus-visible,
+.xcheckbox:focus-visible,
+.xselect-trigger:focus-visible,
+input:focus-visible {
+  outline: none;
+  box-shadow: 0 0 0 2px var(--bg), 0 0 0 4px var(--accent);
+}
+
+button.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
+button.primary:hover {
+  background: #3f79e6;
+}
+
+button.danger {
+  border-color: var(--red);
+  color: var(--red);
+}
+
+button.danger:hover {
+  background: rgba(239, 90, 90, 0.1);
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+main {
+  padding: 24px;
+  max-width: 1200px;
+  margin: 0 auto;
+}
+
+#profileGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: 14px;
+  margin-top: 16px;
+}
+
+.empty-state {
+  color: var(--text-dim);
+  padding: 40px 0;
+  text-align: center;
+}
+
+.tile {
+  position: relative;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 14px;
+}
+
+.tile.selected {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent);
+}
+
+.tile-top {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.tile-select {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.tile-select input[type='checkbox'] {
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+}
+
+.tile-name {
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tile-menu-btn {
+  padding: 4px 8px;
+  line-height: 1;
+  font-weight: 700;
+  border: none;
+  background: transparent;
+}
+
+.tile-menu-btn:hover {
+  background: var(--panel-hover);
+  border-radius: 6px;
+}
+
+.tile-meta {
+  margin-top: 10px;
+  font-size: 12px;
+  color: var(--text-dim);
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 8px;
+  border-radius: 100px;
+  border: 1px solid var(--border);
+}
+
+.dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--text-dim);
+}
+
+.dot.green {
+  background: var(--green);
+}
+
+.dot.red {
+  background: var(--red);
+}
+
+.dot.yellow {
+  background: var(--yellow);
+}
+
+.tile-actions {
+  margin-top: 12px;
+  display: flex;
+  gap: 8px;
+}
+
+.tile-actions button {
+  flex: 1;
+  padding: 6px 10px;
+  font-size: 13px;
+}
+
+/* Barre d'actions groupées : apparaît dès qu'il y a >= 1 profil sélectionné. */
+#bulkToolbar {
+  position: sticky;
+  top: 0;
+  z-index: 5;
+  display: none;
+  align-items: center;
+  gap: 8px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px 14px;
+  margin-top: 16px;
+  flex-wrap: wrap;
+}
+
+#bulkToolbar.visible {
+  display: flex;
+}
+
+#bulkToolbar .count {
+  color: var(--text-dim);
+  margin-right: auto;
+}
+
+/* Menu contextuel : une seule instance réutilisée, positionnée en absolute au clic droit
+   ou au clic sur le bouton "..." de la tuile (voir shared.js: openContextMenu). */
+#contextMenu {
+  position: fixed;
+  display: none;
+  flex-direction: column;
+  min-width: 180px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 6px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+  z-index: 50;
+}
+
+#contextMenu.visible {
+  display: flex;
+}
+
+#contextMenu button {
+  border: none;
+  background: transparent;
+  text-align: left;
+  border-radius: 6px;
+  padding: 8px 10px;
+}
+
+#contextMenu button:hover {
+  background: var(--panel-hover);
+}
+
+#contextMenu button.danger {
+  color: var(--red);
+}
+
+/* Modales génériques (nouveau profil, config proxy groupée...) */
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  display: none;
+  align-items: center;
+  justify-content: center;
+  z-index: 40;
+}
+
+.modal-backdrop.visible {
+  display: flex;
+}
+
+.modal {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 20px;
+  width: 420px;
+  max-width: calc(100vw - 32px);
+  max-height: calc(100vh - 32px);
+  overflow: auto;
+}
+
+.modal h2 {
+  margin-top: 0;
+  font-size: 16px;
+}
+
+.field {
+  margin-bottom: 12px;
+}
+
+.field label {
+  display: block;
+  font-size: 12px;
+  color: var(--text-dim);
+  margin-bottom: 4px;
+}
+
+.field input[type='text'],
+.field select {
+  width: 100%;
+  padding: 8px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text);
+}
+
+.field-inline {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 16px;
+}
+
+details.advanced {
+  margin-top: 4px;
+  margin-bottom: 12px;
+}
+
+details.advanced summary {
+  cursor: pointer;
+  color: var(--text-dim);
+  font-size: 13px;
+}
+
+/* Toasts */
+#toasts {
+  position: fixed;
+  bottom: 16px;
+  right: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  z-index: 60;
+}
+
+.toast {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 14px;
+  font-size: 13px;
+  max-width: 320px;
+}
+
+.toast.error {
+  border-color: var(--red);
+}
+
+a {
+  color: var(--accent);
+}
+
+.mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  word-break: break-all;
+}
+
+.back-link {
+  color: var(--text-dim);
+  text-decoration: none;
+  font-size: 13px;
+}
+
+/* --- Widgets personnalisés (widgets.js) : case à cocher / interrupteur, menu déroulant --- */
+
+.xcheckbox {
+  padding: 0;
+  border-radius: 5px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+  transition: background-color 0.12s ease, border-color 0.12s ease;
+}
+
+.xcheckbox-checkbox {
+  width: 18px;
+  height: 18px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: transparent;
+}
+
+.xcheckbox-checkbox.checked {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
+.xcheckbox-check {
+  width: 12px;
+  height: 12px;
+  transform: scale(0);
+  transition: transform 0.12s ease;
+}
+
+.xcheckbox-checkbox.checked .xcheckbox-check {
+  transform: scale(1);
+}
+
+.xcheckbox-switch {
+  width: 38px;
+  height: 22px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  border-radius: 100px;
+  position: relative;
+  justify-content: flex-start;
+  padding: 2px;
+}
+
+.xcheckbox-switch.checked {
+  background: var(--accent);
+  border-color: var(--accent);
+  justify-content: flex-end;
+}
+
+.xcheckbox-knob {
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--text);
+  transition: transform 0.12s ease;
+}
+
+.xselect {
+  position: relative;
+}
+
+.xselect-trigger {
+  width: 100%;
+  text-align: left;
+  padding: 8px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.xselect-trigger::after {
+  content: '▾';
+  color: var(--text-dim);
+  margin-left: 8px;
+  display: inline-block;
+  transition: transform 0.12s ease;
+}
+
+.xselect-trigger.placeholder {
+  color: var(--text-dim);
+}
+
+.xselect.open .xselect-trigger {
+  border-color: var(--accent);
+}
+
+.xselect.open .xselect-trigger::after {
+  transform: rotate(180deg);
+}
+
+.xselect-panel {
+  position: fixed;
+  z-index: 55;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+  padding: 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  animation: xselect-in 0.1s ease;
+  transform-origin: top;
+}
+
+@keyframes xselect-in {
+  from {
+    opacity: 0;
+    transform: scaleY(0.96) translateY(-2px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.xselect-search {
+  padding: 7px 8px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text);
+}
+
+.xselect-list {
+  max-height: 260px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+}
+
+.xselect-option {
+  border: none;
+  background: transparent;
+  text-align: left;
+  padding: 8px 10px;
+  border-radius: 6px;
+  color: var(--text);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  transition: background-color 0.1s ease;
+}
+
+.xselect-option:hover {
+  background: var(--panel-hover);
+}
+
+.xselect-option.selected {
+  background: rgba(79, 140, 255, 0.12);
+  color: var(--accent);
+}
+
+.xselect-option.selected::after {
+  content: '✓';
+  font-size: 12px;
+}
+
+.xselect-empty {
+  padding: 10px;
+  color: var(--text-dim);
+  font-size: 13px;
+  text-align: center;
+}
+
+/* Scrollbars fines et discrètes, cohérentes sur tous les conteneurs qui défilent (menu
+   déroulant, modales). */
+.xselect-list,
+.modal {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border) transparent;
+}
+
+.xselect-list::-webkit-scrollbar,
+.modal::-webkit-scrollbar {
+  width: 6px;
+}
+
+.xselect-list::-webkit-scrollbar-track,
+.modal::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.xselect-list::-webkit-scrollbar-thumb,
+.modal::-webkit-scrollbar-thumb {
+  background-color: var(--border);
+  border-radius: 100px;
+}
+
+.xselect-list::-webkit-scrollbar-thumb:hover,
+.modal::-webkit-scrollbar-thumb:hover {
+  background-color: var(--text-dim);
+}
