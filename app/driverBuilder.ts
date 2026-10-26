@@ -429,6 +429,98 @@ function hideWebdriverForWebkit(): void {
 }
 
 /**
+ * Découvert en creusant le dernier finding restant sur les presets WebKit contre
+ * bot-detector.rebrowser.net ("popupBlocking", 2026-10-26) : `window.open()` réussit depuis WebKit
+ * même appelé en dehors de tout geste utilisateur (le test ouvre un popup directement depuis un
+ * script, sans clic). Contrairement à Chromium (`--disable-popup-blocking`, un simple flag de
+ * lancement qu'on retire déjà), aucun flag/variable d'environnement/commande du protocole distant
+ * WebKit n'expose ce réglage côté Node : `webkit_settings_set_javascript_can_open_windows_
+ * automatically` existe bien dans `libwebkitgtk`/`libWPEWebKit` (vérifié via `strings` sur les deux
+ * libs installées), mais n'est appelé QUE par le binaire `MiniBrowser` précompilé que distribue
+ * Playwright, sans aucun moyen de lui passer une valeur différente.
+ *
+ * `navigator.userActivation.isActive` ne peut PAS servir de signal ici : vérifié empiriquement que
+ * WebKit le rapporte déjà `true` sous automatisation Playwright, même sans aucune interaction
+ * réelle — c'est précisément CE qui laisse passer le popup, et une vérification basée dessus ne
+ * distinguerait donc rien.
+ *
+ * Contournement : réimplémenter nous-mêmes la sémantique d'un vrai bloqueur de popups, au niveau
+ * JS, en se basant sur `Event.isTrusted` à la place — fiable, lui : un clic réellement injecté par
+ * `page.click()` (au niveau input de la plateforme, comme un vrai utilisateur) reste `isTrusted:
+ * true`, alors qu'un script qui invoque `window.open()` de son propre chef n'est précédé d'AUCUN
+ * évènement de ce type. On écoute les gestes capables de déclencher un popup légitime (clic,
+ * relâchement de pointeur, touche, toucher) en phase de capture au niveau document, on autorise
+ * `window.open` pendant une courte fenêtre après un geste `isTrusted`.
+ *
+ * Piège rencontré et corrigé : une première version remettait le drapeau à `false` via une
+ * MICROtâche (`Promise.resolve().then(...)`), en supposant qu'elle ne s'exécuterait qu'après la
+ * fin de TOUTE la distribution de l'évènement (capture + cible + bubbling). Faux — vérifié
+ * empiriquement avec un clic réel sur un bouton via `page.click()` : le flag retombait à `false`
+ * AVANT même que le gestionnaire `onclick` de la page n'appelle `window.open`, bloquant un vrai
+ * clic légitime. Cause : la spec DOM effectue un "microtask checkpoint" après CHAQUE invocation
+ * individuelle d'écouteur pendant une distribution d'évènement (étape "clean up after running
+ * script"), pas seulement à la toute fin — donc une microtâche programmée dans NOTRE écouteur
+ * (phase capture, document) s'exécute déjà avant que l'écouteur SUIVANT (celui du bouton, qui
+ * appelle `window.open`) ne soit invoké. Un vrai `setTimeout` (macrotâche) n'a pas ce problème :
+ * il attend la fin complète de la tâche en cours, distribution d'évènement incluse. Fenêtre de
+ * 2 secondes : large marge pour couvrir aussi bien un `window.open` synchrone dans le gestionnaire
+ * qu'un `window.open` légèrement différé après le clic (ex. `setTimeout(() => window.open(...))`,
+ * motif courant sur de vrais sites), tout en restant courte pour qu'un script de page sans rapport,
+ * exécuté bien après, ne profite jamais d'un geste périmé.
+ *
+ * Fonction top-level pure : son code source est sérialisé tel quel par Playwright.
+ */
+function patchPopupBlockingForWebkit(): void {
+  function patchToStringNative(patchedFn: unknown, nativeStr: string): void {
+    const prevToString = Function.prototype.toString;
+    const map = new WeakMap<object, string>();
+    const holder = {
+      toString(this: unknown) {
+        if ((typeof this === 'object' && this !== null) || typeof this === 'function') {
+          if (map.has(this as object)) return map.get(this as object)!;
+        }
+        return prevToString.call(this as Function);
+      },
+    };
+    const fakeToString = holder.toString;
+    map.set(patchedFn as object, nativeStr);
+    map.set(fakeToString, 'function toString() { [native code] }');
+    Object.defineProperty(Function.prototype, 'toString', {
+      value: fakeToString,
+      writable: true,
+      configurable: true,
+    });
+  }
+
+  let hasRecentGesture = false;
+  const gestureEvents = ['click', 'pointerup', 'keydown', 'touchend'];
+  for (const type of gestureEvents) {
+    document.addEventListener(
+      type,
+      (e) => {
+        if (!e.isTrusted) return;
+        hasRecentGesture = true;
+        setTimeout(() => {
+          hasRecentGesture = false;
+        }, 2000);
+      },
+      true
+    );
+  }
+
+  const origOpen = window.open;
+  const origOpenStr = origOpen.toString();
+  const wrappedOpen = {
+    open(this: Window, ...args: Parameters<typeof window.open>) {
+      if (!hasRecentGesture) return null; // mime un popup bloqué, comme un vrai navigateur
+      return origOpen.apply(this, args);
+    },
+  }.open;
+  window.open = wrappedOpen as typeof window.open;
+  patchToStringNative(wrappedOpen, origOpenStr);
+}
+
+/**
  * Découvert en testant les presets 'Pixel 7' ET 'iPhone 15' RÉELS contre
  * bot-detector.rebrowser.net (2026-10-26) : `navigator.maxTouchPoints` ne correspond jamais à un
  * vrai téléphone sur aucun des deux moteurs.
@@ -1978,6 +2070,15 @@ export class DriverBuilder {
         // dès la première navigation).
         if (engine === 'webkit') {
           await context.addInitScript(hideWebdriverForWebkit);
+        }
+
+        // Blocage de popups sans geste réel (cf. doc de `patchPopupBlockingForWebkit`) : Chromium
+        // n'en a pas besoin (le flag `--disable-popup-blocking` de Playwright est déjà retiré plus
+        // haut, le VRAI bloqueur natif de Chrome fait le travail) ; WebKit n'a pas d'équivalent
+        // accessible depuis Node (réglage compilé en dur dans le binaire `MiniBrowser` de
+        // Playwright), donc réimplémenté nous-mêmes au niveau JS.
+        if (engine === 'webkit') {
+          await context.addInitScript(patchPopupBlockingForWebkit);
         }
 
         // `navigator.maxTouchPoints` (cf. doc de `patchMaxTouchPoints`) : uniquement pour les

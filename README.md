@@ -219,12 +219,43 @@ propre ?"), chaque preset du dashboard a été lancé pour de vrai (pas un test 
    `navigator.platform`/Client Hints suivent désormais le vrai host (Linux ici) — `platformMismatch`
    rouge garanti. 'desktop' fait tout pareil, en mieux.
 
-**Résultat final, tous testés à nouveau après correctifs** :
-- 'Pixel 7' (Android/Chromium) : **0 finding**, entièrement propre.
-- 'iPhone 15' (iOS/WebKit), 'iPad Mini' (iOS/WebKit), 'Desktop Safari' (macOS/WebKit) : plus qu'un
-  seul 🟡 chacun (`popupBlocking`) — pas de correctif WebKit-side connu (contrairement à Chromium,
-  qui a le flag `--disable-popup-blocking` CLI), et l'outil lui-même dit que ça peut être un
-  réglage de site légitime, pas forcément un signal d'automatisation. Laissé tel quel.
+**Résultat final, tous testés à nouveau après correctifs** : les 4 presets testés ('Pixel 7',
+'iPhone 15', 'iPad Mini', 'Desktop Safari') sont **à 0 finding rouge/jaune**, entièrement propres.
+
+Le dernier `popupBlocking` 🟡 restant (WebKit) a été creusé et corrigé séparément (cf. §5bis
+ci-dessous) — pas un simple flag comme pour Chromium.
+
+### 5bis. `popupBlocking` sur WebKit — creusé et corrigé (2026-10-26)
+
+**Pourquoi pas un simple flag comme Chromium** : `window.open()` réussit sur WebKit même appelé en
+dehors de tout geste utilisateur. Le réglage qui contrôle ça existe bien dans le moteur
+(`webkit_settings_set_javascript_can_open_windows_automatically`, confirmé présent via `strings`
+sur `libwebkitgtk`/`libWPEWebKit`), mais n'est appelé QUE par le binaire `MiniBrowser` précompilé
+que distribue Playwright — aucun flag, variable d'environnement ou commande du protocole distant
+WebKit ne permet de lui passer une valeur différente depuis Node.
+
+**`navigator.userActivation.isActive` ne peut pas servir de signal** : vérifié empiriquement qu'il
+vaut déjà `true` sous automatisation Playwright/WebKit, sans aucune interaction réelle — c'est
+précisément ce qui laisse passer le popup, donc une vérification dessus ne distinguerait rien.
+
+**Solution retenue** : réimplémenter la sémantique d'un vrai bloqueur de popups au niveau JS, basée
+sur `Event.isTrusted` (fiable : un clic injecté par `page.click()` au niveau input de la plateforme
+reste `isTrusted: true`, contrairement à un `window.open()` appelé directement par un script).
+`window.open` n'est autorisé que dans une courte fenêtre après un geste `isTrusted` réel.
+
+**Piège rencontré en cours de route** : la première version utilisait une microtâche
+(`Promise.resolve().then(...)`) pour refermer la fenêtre d'autorisation, en supposant qu'elle ne
+s'exécuterait qu'après la fin complète de la distribution de l'évènement. Faux — la spec DOM fait
+un "microtask checkpoint" après CHAQUE écouteur individuel pendant une distribution d'évènement,
+pas seulement à la fin : la microtâche s'exécutait donc déjà entre notre propre écouteur et celui
+du bouton de la page, qui n'avait donc plus jamais la fenêtre ouverte au moment d'appeler
+`window.open` — **ça bloquait aussi les vrais clics légitimes**, repéré en testant un clic réel via
+`page.click()` sur un bouton avec `onclick="window.open(...)"`. Corrigé en remplaçant la microtâche
+par un vrai `setTimeout` (macrotâche, qui attend la fin complète de la tâche en cours).
+
+**Vérifié après correction** : un script qui appelle `window.open()` sans clic reste bloqué (comme
+avant), ET un vrai clic sur un bouton qui ouvre un popup fonctionne de nouveau normalement — les
+deux testés directement, pas supposés.
 
 ## 6. Bug critique corrigé : Service Worker cassait des sites réels (YouTube) — page blanche
 
