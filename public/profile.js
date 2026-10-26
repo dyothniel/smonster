@@ -13,7 +13,10 @@ let current = null;
 const fHeadlessWidget = createCheckbox({ variant: 'switch', title: 'Lancer sans interface graphique' });
 document.getElementById('fHeadlessContainer').appendChild(fHeadlessWidget);
 
-const fDeviceWidget = createSelect({ options: DEVICE_PRESETS });
+const fDeviceWidget = createSelect({
+  options: DEVICE_PRESETS,
+  onChange: (v) => updateDevicePlatformHint(v, 'fDevicePlatformHint'),
+});
 document.getElementById('fDeviceContainer').appendChild(fDeviceWidget);
 
 const fLocaleWidget = createSelect({ options: LOCALE_PRESETS });
@@ -65,6 +68,7 @@ function render() {
   document.getElementById('fName').value = p.name;
   fHeadlessWidget.checked = p.headless;
   fDeviceWidget.value = p.device;
+  updateDevicePlatformHint(p.device, 'fDevicePlatformHint');
   fLocaleWidget.value = p.locale;
   fTzWidget.value = p.timezoneId;
   document.getElementById('fProxyServer').value = (p.proxy && p.proxy.server) || '';

@@ -237,8 +237,13 @@ document.getElementById('proxyForm').addEventListener('submit', async (e) => {
 const npHeadlessWidget = createCheckbox({ checked: true, variant: 'switch', title: 'Lancer sans interface graphique' });
 document.getElementById('npHeadlessContainer').appendChild(npHeadlessWidget);
 
-const npDeviceWidget = createSelect({ options: DEVICE_PRESETS, value: 'desktop' });
+const npDeviceWidget = createSelect({
+  options: DEVICE_PRESETS,
+  value: 'desktop',
+  onChange: (v) => updateDevicePlatformHint(v, 'npDevicePlatformHint'),
+});
 document.getElementById('npDeviceContainer').appendChild(npDeviceWidget);
+updateDevicePlatformHint(npDeviceWidget.value, 'npDevicePlatformHint');
 
 const npLocaleWidget = createSelect({ options: LOCALE_PRESETS, value: 'fr-FR' });
 document.getElementById('npLocaleContainer').appendChild(npLocaleWidget);
@@ -250,6 +255,7 @@ document.getElementById('newProfileBtn').addEventListener('click', () => {
   document.getElementById('newProfileForm').reset();
   npHeadlessWidget.checked = true;
   npDeviceWidget.value = 'desktop';
+  updateDevicePlatformHint(npDeviceWidget.value, 'npDevicePlatformHint');
   npLocaleWidget.value = 'fr-FR';
   npTzWidget.value = 'Europe/Paris';
   document.getElementById('newProfileModal').classList.add('visible');

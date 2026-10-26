@@ -1,11 +1,29 @@
-import { chromium, webkit } from 'playwright-extra';
-import stealth from 'puppeteer-extra-plugin-stealth';
-// `devices` est importé depuis `playwright` (et non `playwright-extra`) : playwright-extra
-// se contente de relayer le même objet au runtime, mais son .d.ts le type comme une
-// intersection avec un tableau, ce qui pollue `keyof typeof devices` avec `symbol` et fait
-// planter le typage de `device` plus bas (TS2731 sur le template literal).
-import { devices as playwrightDevices } from 'playwright';
-import type { Browser, BrowserContext, Page } from 'playwright';
+// `chromium` vient de `patchright` (fork de playwright-core, cf. doc sur `engineArgs` dans
+// `build()`) : corrige la fuite CDP `Runtime.enable` ("runtimeEnableLeak" sur
+// bot-detector.rebrowser.net) que Playwright classique laisse passer, sans dépendre d'un plugin
+// stealth tiers (cf. plus bas, suppression de `playwright-extra`/`puppeteer-extra-plugin-stealth`
+// : plusieurs de ses évasions s'appuient sur `new Proxy(...)`, détectables structurellement, ET
+// une au moins — `iframe.contentWindow` — est désormais reconnue NOMMÉMENT par cet outil comme
+// signature de cette librairie précise, donc un risque net plutôt qu'un correctif discret).
+import { chromium } from 'patchright';
+// `webkit` reste sur le paquet `playwright` standard (et pas `patchright`) : Patchright ne patche
+// QUE Chromium, et son fork de webkit cible une révision de binaire différente de celle déjà
+// installée sur cette machine pour `playwright` — vérifié empiriquement, lancer `patchright`'s
+// webkit échoue ("Executable doesn't exist at .../webkit-2370/...") et demanderait un nouveau
+// téléchargement, inutile puisque webkit n'a de toute façon aucune évasion anti-détection
+// spécifique côté Patchright à en tirer.
+// `devices` : son typage expose le même piège sous `playwright-extra` ET `patchright` (intersection
+// avec un tableau qui pollue `keyof typeof devices` de `symbol`, TS2731 sur le template literal
+// plus bas) — importé depuis le paquet `playwright` tout nu pour l'éviter.
+import { webkit, devices as playwrightDevices } from 'playwright';
+// Types pris sur `patchright` (pas `playwright`) : `chromium` ci-dessus en vient, et c'est lui
+// qui construit la quasi-totalité des `BrowserContext`/`Page`/`Browser` de ce fichier. Les deux
+// paquets sont des forks quasi identiques du même code (patchright-core dérive de
+// playwright-core), structurellement interchangeables à l'exécution, mais TypeScript les traite
+// comme des types NOMINALEMENT distincts (classes avec membres privés) — d'où le cast explicite
+// au seul endroit où `webkit` (resté sur `playwright`, cf. import ci-dessus) produit un objet
+// réellement typé `playwright-core`, dans `build()`.
+import type { Browser, BrowserContext, Page } from 'patchright';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
@@ -13,6 +31,30 @@ import { randomUUID } from 'crypto';
 import type { ProxyRotator } from './proxyRotator';
 
 type Engine = 'chromium' | 'webkit';
+
+/**
+ * Lit l'état de la page dans le MONDE PRINCIPAL plutôt que le monde isolé où `page.evaluate`
+ * s'exécute par défaut côté Chromium sous Patchright (son mécanisme anti-fuite `Runtime.enable`,
+ * cf. doc sur l'import de `chromium` plus haut). Découvert en vérifiant empiriquement qu'un
+ * correctif posé via `context.addInitScript` (monde principal) est invisible à un `page.evaluate`
+ * isolé : chaque monde JS a sa PROPRE copie des prototypes des objets DOM/WebIDL (`navigator`,
+ * `WebGLRenderingContext`...), même si le DOM sous-jacent reste partagé — un comportement hérité
+ * du modèle "isolated world" des content scripts d'extension, que Patchright réutilise.
+ *
+ * `engine` est nécessaire (pas de détection auto) : le 4e argument positionnel qui désactive le
+ * monde isolé (signature `evaluate<R>(pageFunction, arg?, options?, isolatedContext?)` de
+ * `patchright-core`) fait PLANTER `webkit`, resté sur `playwright` classique — vérifié
+ * empiriquement, contrairement à une hypothèse initiale optimiste ("arguments en trop ignorés
+ * silencieusement"), son implémentation lève `Too many arguments. If you need to pass more than
+ * 1 argument to the function wrap them in an object.` dès qu'un 3e argument positionnel est
+ * fourni, peu importe sa valeur.
+ */
+export function mainWorldEvaluate<R>(page: Page, pageFunction: () => R, engine: Engine): Promise<R> {
+  if (engine === 'webkit') {
+    return page.evaluate(pageFunction);
+  }
+  return page.evaluate(pageFunction, undefined, undefined, false);
+}
 
 /**
  * Dérive un seed 32 bits stable à partir d'une chaîne (ici, `profileDir`). Même profil (même
@@ -46,6 +88,46 @@ export function hashToSeed(str: string): number {
  * sérialisé tel quel par Playwright pour tourner dans la page via `context.addInitScript`.
  */
 function applyFingerprintNoise(seed: number): void {
+  // Un `fn.toString()` sur une fonction qu'on vient de réécrire révèle notre code source au lieu
+  // de "function x() { [native code] }" — un signal de détection de "masking" direct (constaté
+  // sur pixelscan.net). On capture le VRAI résultat natif AVANT d'écraser la fonction, puis on
+  // fait mentir `Function.prototype.toString` spécifiquement pour CETTE fonction patchée. Chaque
+  // appel empile un nouveau Proxy par-dessus le précédent (chacun ne gère que SA fonction, et
+  // délègue à `target` — la couche du dessous — sinon), donc patcher plusieurs fonctions
+  // s'accumule proprement sans écraser les patches précédents.
+  function patchToStringNative(patchedFn: unknown, nativeStr: string): void {
+    // Découvert via bot-detector.rebrowser.net ("nativeTampering") : un `new Proxy(...)` sur
+    // `Function.prototype.toString` se détecte STRUCTURELLEMENT (ex. test de cycle sur
+    // `__proto__`), indépendamment de ce que le piège `apply` renvoie — masquer le CONTENU du
+    // `toString()` ne suffit pas si l'objet lui-même reste un Proxy repérable. On utilise donc
+    // une fonction normale fermée sur une `WeakMap` plutôt qu'un Proxy : chaque appel de
+    // `patchToStringNative` chaîne un nouveau remplaçant (fonction normale, pas Proxy) par-dessus
+    // le précédent `Function.prototype.toString` (qui, après le tout premier appel, n'est déjà
+    // plus un Proxy lui non plus), avec repli vers lui pour toute fonction non enregistrée.
+    // Syntaxe méthode (`toString(){}` dans un littéral objet) plutôt que `function(){}` : une
+    // fonction normale a une `.prototype` propre par défaut (signal de détection distinct, repéré
+    // sur `HTMLCanvasElement.toDataURL` via le même outil), une méthode n'en a pas — comme les
+    // vraies méthodes natives.
+    const prevToString = Function.prototype.toString;
+    const map = new WeakMap<object, string>();
+    const holder = {
+      toString(this: unknown) {
+        if ((typeof this === 'object' && this !== null) || typeof this === 'function') {
+          if (map.has(this as object)) return map.get(this as object)!;
+        }
+        return prevToString.call(this as Function);
+      },
+    };
+    const fakeToString = holder.toString;
+    map.set(patchedFn as object, nativeStr);
+    map.set(fakeToString, 'function toString() { [native code] }');
+    Object.defineProperty(Function.prototype, 'toString', {
+      value: fakeToString,
+      writable: true,
+      configurable: true,
+    });
+  }
+
   function pixelNoise(index: number): number {
     let h = (seed ^ index) >>> 0;
     h = Math.imul(h ^ (h >>> 16), 0x45d9f3b);
@@ -88,12 +170,18 @@ function applyFingerprintNoise(seed: number): void {
   }
 
   const origGetImageData = CanvasRenderingContext2D.prototype.getImageData;
-  CanvasRenderingContext2D.prototype.getImageData = function (
-    this: CanvasRenderingContext2D,
-    ...args: Parameters<typeof origGetImageData>
-  ) {
-    return noiseImageData(origGetImageData.apply(this, args));
-  };
+  const origGetImageDataStr = origGetImageData.toString();
+  // Syntaxe méthode (`{ x(){} }.x`) plutôt que `function(){}` : une fonction classique a une
+  // `.prototype` propre par défaut — signal de détection distinct du `toString()`, repéré via
+  // bot-detector.rebrowser.net ("nativeTampering", "has own prototype") — qu'une méthode d'objet
+  // littéral n'a pas, comme les vraies méthodes natives. S'applique à toutes les fonctions
+  // patchées de cette file (canvas/WebGL/audio ci-dessous).
+  CanvasRenderingContext2D.prototype.getImageData = {
+    getImageData(this: CanvasRenderingContext2D, ...args: Parameters<typeof origGetImageData>) {
+      return noiseImageData(origGetImageData.apply(this, args));
+    },
+  }.getImageData;
+  patchToStringNative(CanvasRenderingContext2D.prototype.getImageData, origGetImageDataStr);
 
   // `toDataURL`/`toBlob` ne passent pas forcément par `getImageData` en interne : on les fait
   // exporter depuis un clone bruité plutôt que le canvas d'origine, pour rester cohérent avec ce
@@ -111,14 +199,22 @@ function applyFingerprintNoise(seed: number): void {
   }
 
   const origToDataURL = HTMLCanvasElement.prototype.toDataURL;
-  HTMLCanvasElement.prototype.toDataURL = function (this: HTMLCanvasElement, ...args: unknown[]) {
-    return (origToDataURL as (...a: unknown[]) => string).apply(noisyClone(this), args);
-  };
+  const origToDataURLStr = origToDataURL.toString();
+  HTMLCanvasElement.prototype.toDataURL = {
+    toDataURL(this: HTMLCanvasElement, ...args: unknown[]) {
+      return (origToDataURL as (...a: unknown[]) => string).apply(noisyClone(this), args);
+    },
+  }.toDataURL;
+  patchToStringNative(HTMLCanvasElement.prototype.toDataURL, origToDataURLStr);
 
   const origToBlob = HTMLCanvasElement.prototype.toBlob;
-  HTMLCanvasElement.prototype.toBlob = function (this: HTMLCanvasElement, ...args: unknown[]) {
-    return (origToBlob as (...a: unknown[]) => void).apply(noisyClone(this), args);
-  };
+  const origToBlobStr = origToBlob.toString();
+  HTMLCanvasElement.prototype.toBlob = {
+    toBlob(this: HTMLCanvasElement, ...args: unknown[]) {
+      return (origToBlob as (...a: unknown[]) => void).apply(noisyClone(this), args);
+    },
+  }.toBlob;
+  patchToStringNative(HTMLCanvasElement.prototype.toBlob, origToBlobStr);
 
   // --- WebGL : readPixels en direct (scripts qui n'exportent jamais via toDataURL) ---------
   function noiseWebglBuffer(pixels: unknown): void {
@@ -137,13 +233,17 @@ function applyFingerprintNoise(seed: number): void {
   function patchReadPixels(ctor: { prototype: Record<string, any> } | undefined): void {
     if (!ctor) return;
     const origReadPixels = ctor.prototype.readPixels;
-    ctor.prototype.readPixels = function (this: unknown, ...args: unknown[]) {
-      const result = origReadPixels.apply(this, args);
-      // Dernier argument = le buffer de sortie (sauf variante WebGL2 avec PBO + offset numérique,
-      // ignorée ici : `noiseWebglBuffer` ne fait rien sur un nombre).
-      noiseWebglBuffer(args[args.length - 1]);
-      return result;
-    };
+    const origReadPixelsStr = origReadPixels.toString();
+    ctor.prototype.readPixels = {
+      readPixels(this: unknown, ...args: unknown[]) {
+        const result = origReadPixels.apply(this, args);
+        // Dernier argument = le buffer de sortie (sauf variante WebGL2 avec PBO + offset
+        // numérique, ignorée ici : `noiseWebglBuffer` ne fait rien sur un nombre).
+        noiseWebglBuffer(args[args.length - 1]);
+        return result;
+      },
+    }.readPixels;
+    patchToStringNative(ctor.prototype.readPixels, origReadPixelsStr);
   }
   patchReadPixels(typeof WebGLRenderingContext !== 'undefined' ? WebGLRenderingContext : undefined);
   patchReadPixels(typeof WebGL2RenderingContext !== 'undefined' ? WebGL2RenderingContext : undefined);
@@ -151,19 +251,23 @@ function applyFingerprintNoise(seed: number): void {
   // --- Audio : AudioBuffer.getChannelData (OfflineAudioContext + lecture d'échantillons) ---
   if (typeof AudioBuffer !== 'undefined') {
     const origGetChannelData = AudioBuffer.prototype.getChannelData;
-    AudioBuffer.prototype.getChannelData = function (this: AudioBuffer, channel: number) {
-      const original = origGetChannelData.call(this, channel);
-      // Copie plutôt que mutation en place : l'AudioBuffer d'origine reste intact, donc chaque
-      // appel repart des VRAIS échantillons + le même bruit déterministe, sans dérive cumulative
-      // si la fonction est appelée plusieurs fois sur le même buffer/canal.
-      const noised = new Float32Array(original.length);
-      for (let i = 0; i < original.length; i++) {
-        // Échelle minuscule (échantillons audio en [-1, 1]) : assez pour changer le hash, jamais
-        // audible ni assez gros pour ressembler à une erreur de rendu.
-        noised[i] = original[i] + pixelNoise(i) * 0.0000001;
-      }
-      return noised;
-    };
+    const origGetChannelDataStr = origGetChannelData.toString();
+    AudioBuffer.prototype.getChannelData = {
+      getChannelData(this: AudioBuffer, channel: number) {
+        const original = origGetChannelData.call(this, channel);
+        // Copie plutôt que mutation en place : l'AudioBuffer d'origine reste intact, donc chaque
+        // appel repart des VRAIS échantillons + le même bruit déterministe, sans dérive
+        // cumulative si la fonction est appelée plusieurs fois sur le même buffer/canal.
+        const noised = new Float32Array(original.length);
+        for (let i = 0; i < original.length; i++) {
+          // Échelle minuscule (échantillons audio en [-1, 1]) : assez pour changer le hash,
+          // jamais audible ni assez gros pour ressembler à une erreur de rendu.
+          noised[i] = original[i] + pixelNoise(i) * 0.0000001;
+        }
+        return noised;
+      },
+    }.getChannelData;
+    patchToStringNative(AudioBuffer.prototype.getChannelData, origGetChannelDataStr);
   }
 }
 
@@ -263,6 +367,118 @@ function blockWebRtcLeaks(): void {
 }
 
 /**
+ * Découvert en testant un profil 'iPhone 15' RÉEL contre bot-detector.rebrowser.net (2026-10-26) :
+ * `navigator.webdriver` vaut `true` sur WebKit dès qu'on navigue vers une vraie page — alors que
+ * `healthCheck()` (cf. `build()`) le neutralise bien, mais UNIQUEMENT sur `about:blank`, la page
+ * jetable où il tourne. Cette neutralisation ne survit pas à la navigation suivante : WebKit n'a
+ * pas d'équivalent du flag Chromium `--disable-blink-features=AutomationControlled` (qui, lui,
+ * empêche `navigator.webdriver` d'être `true` dans N'IMPORTE QUEL document, pas seulement le
+ * premier), donc chaque NOUVELLE page WebKit repart avec la vraie valeur native `true`.
+ *
+ * Solution : enregistrer CE correctif via `context.addInitScript` (s'applique à CHAQUE nouveau
+ * document, pas qu'une fois) — PAS fait jusqu'ici volontairement (cf. l'ancien commentaire sur ce
+ * point, toujours vrai) car combiner un `addInitScript` ET la redéfinition de `healthCheck` dans
+ * le MÊME document corrompt le getter natif (`TypeError: ... can only be used on instances of
+ * Navigator` à la lecture suivante, reproductible sur iPhone ET Desktop Safari). Mais cette
+ * fonction-ci ne redéfinit QUE si `navigator.webdriver === true` — une fois qu'elle a tourné (via
+ * `addInitScript`, donc AVANT tout script de la page), la condition est déjà fausse quand
+ * `healthCheck` lit la même page juste après : sa propre redéfinition ne se déclenche jamais, donc
+ * jamais de double redéfinition. Un seul correctif réel au total, juste posé au bon endroit (CHAQUE
+ * document, pas un seul jetable).
+ *
+ * Fonction top-level pure : son code source est sérialisé tel quel par Playwright.
+ */
+function hideWebdriverForWebkit(): void {
+  // cf. doc identique dans `applyFingerprintNoise`/`patchHardwareConcurrencyAndWebglVendor` —
+  // dupliquée ici car chaque fonction top-level enregistrée via `context.addInitScript` doit être
+  // autonome. Sans ça : trouvé en testant contre bot-detector.rebrowser.net ("nativeTampering",
+  // 2026-10-26) qu'un `Object.defineProperty` nu — sans masquer le `toString()` du getter qu'il
+  // remplace — se détecte en comparant son `Function.prototype.toString()` au format natif attendu.
+  function patchToStringNative(patchedFn: unknown, nativeStr: string): void {
+    const prevToString = Function.prototype.toString;
+    const map = new WeakMap<object, string>();
+    const holder = {
+      toString(this: unknown) {
+        if ((typeof this === 'object' && this !== null) || typeof this === 'function') {
+          if (map.has(this as object)) return map.get(this as object)!;
+        }
+        return prevToString.call(this as Function);
+      },
+    };
+    const fakeToString = holder.toString;
+    map.set(patchedFn as object, nativeStr);
+    map.set(fakeToString, 'function toString() { [native code] }');
+    Object.defineProperty(Function.prototype, 'toString', {
+      value: fakeToString,
+      writable: true,
+      configurable: true,
+    });
+  }
+
+  if (navigator.webdriver === true) {
+    const proto = Object.getPrototypeOf(navigator);
+    const origGetter = Object.getOwnPropertyDescriptor(proto, 'webdriver')?.get;
+    const origGetterStr = origGetter ? origGetter.toString() : 'function get webdriver() { [native code] }';
+    Object.defineProperty(proto, 'webdriver', {
+      get: () => false,
+      configurable: true,
+      enumerable: true,
+    });
+    patchToStringNative(Object.getOwnPropertyDescriptor(proto, 'webdriver')!.get, origGetterStr);
+  }
+}
+
+/**
+ * Découvert en testant les presets 'Pixel 7' ET 'iPhone 15' RÉELS contre
+ * bot-detector.rebrowser.net (2026-10-26) : `navigator.maxTouchPoints` ne correspond jamais à un
+ * vrai téléphone sur aucun des deux moteurs.
+ *   - Chromium : vaut 1, la valeur par défaut de l'émulation tactile CDP (`Emulation.
+ *     setTouchEmulationEnabled`) que Playwright pose pour tout device `hasTouch: true` — un vrai
+ *     téléphone Android rapporte 5 (support multi-touch).
+ *   - WebKit : vaut carrément 0 (aucun support tactile signalé du tout), alors que l'UA annonce un
+ *     UA mobile — l'outil le signale explicitement comme incohérent ("Mobile user agent without
+ *     any touch support"). Un vrai iPhone Safari rapporte aussi 5.
+ * Appliquée uniquement pour les devices avec `hasTouch: true` (presets mobiles) — jamais pour
+ * 'desktop', dont le vrai 0 est correct et ne doit pas être touché.
+ *
+ * Fonction top-level pure : son code source est sérialisé tel quel par Playwright.
+ */
+function patchMaxTouchPoints(points: number): void {
+  // cf. doc de `patchToStringNative` dans `hideWebdriverForWebkit` juste au-dessus — même
+  // raisonnement, dupliqué pour la même raison d'autonomie des fonctions `addInitScript`.
+  function patchToStringNative(patchedFn: unknown, nativeStr: string): void {
+    const prevToString = Function.prototype.toString;
+    const map = new WeakMap<object, string>();
+    const holder = {
+      toString(this: unknown) {
+        if ((typeof this === 'object' && this !== null) || typeof this === 'function') {
+          if (map.has(this as object)) return map.get(this as object)!;
+        }
+        return prevToString.call(this as Function);
+      },
+    };
+    const fakeToString = holder.toString;
+    map.set(patchedFn as object, nativeStr);
+    map.set(fakeToString, 'function toString() { [native code] }');
+    Object.defineProperty(Function.prototype, 'toString', {
+      value: fakeToString,
+      writable: true,
+      configurable: true,
+    });
+  }
+
+  const proto = Object.getPrototypeOf(navigator);
+  const origGetter = Object.getOwnPropertyDescriptor(proto, 'maxTouchPoints')?.get;
+  const origGetterStr = origGetter ? origGetter.toString() : 'function get maxTouchPoints() { [native code] }';
+  Object.defineProperty(proto, 'maxTouchPoints', {
+    get: () => points,
+    configurable: true,
+    enumerable: true,
+  });
+  patchToStringNative(Object.getOwnPropertyDescriptor(proto, 'maxTouchPoints')!.get, origGetterStr);
+}
+
+/**
  * Détermine le moteur (`chromium` ou `webkit`) à utiliser pour un `device` donné, sans rien
  * lancer. Extrait de `pickDeviceConfig` en fonction pure et exportée pour pouvoir tester le
  * routing iOS/Android/desktop sans dépendre d'un binaire de navigateur installé.
@@ -290,20 +506,45 @@ export function resolveEngineForDevice(device: NonNullable<DriverBuilderOptions[
   return preset.defaultBrowserType;
 }
 
-type PlatformCategory = 'windows' | 'macos' | 'android' | 'ios';
+type PlatformCategory = 'windows' | 'macos' | 'linux' | 'android' | 'ios';
+
+/**
+ * Découvert via bot-detector.rebrowser.net ("platformMismatch") : un profil 'desktop' qui prétend
+ * "Windows" en dur, peu importe le vrai système hôte, se trahit sur un host Linux/macOS via la
+ * couleur CSS système `ActiveText` — résolue par le moteur natif de Chromium (`NativeTheme`, en
+ * C++), qui interroge le VRAI thème de l'OS, hors de portée de tout override JS (`navigator.
+ * platform`, Client Hints...). Sur Linux ET macOS, Chrome retombe sur une palette intégrée fixe
+ * (rouge pur) pour `ActiveText` ; seul un Chrome qui tourne VRAIMENT sous Windows obtient la vraie
+ * couleur "hotlight" via l'API Windows. Donc : claim le système qu'on simule, jamais un autre —
+ * testé et confirmé (2026-10-26) qu'un profil qui claim honnêtement son host réel fait passer ce
+ * test au vert.
+ */
+export function detectHostPlatformCategory(): 'windows' | 'macos' | 'linux' {
+  switch (process.platform) {
+    case 'win32':
+      return 'windows';
+    case 'darwin':
+      return 'macos';
+    default:
+      return 'linux';
+  }
+}
 
 /**
  * Déduit la plateforme à simuler — pour le fingerprint de polices (`FONT_WHITELISTS`), mais
  * aussi `navigator.platform`/Client Hints ci-dessous — à partir de ce qu'on sait déjà du device :
- * `engine` (chromium routé côté Windows/Android, webkit côté macOS/iOS) et `isMobile` (desktop vs
- * mobile pour ce même moteur). Pas de nouvelle donnée nécessaire : ce sont exactement les infos
- * que `resolveEngineForDevice`/`pickDeviceConfig` ont déjà résolues.
+ * `engine` (chromium routé côté desktop/Android, webkit côté macOS/iOS) et `isMobile` (desktop vs
+ * mobile pour ce même moteur). Les presets mobiles/webkit restent des émulations figées (choisies
+ * explicitement par leur nom dans le dashboard, ex. 'iPhone 15') — aucune machine ne tourne
+ * vraiment sous iOS/Android ici, donc rien à détecter pour eux. Seul le desktop Chromium varie
+ * réellement d'une machine à l'autre : cf. doc de `detectHostPlatformCategory`.
  */
 function choosePlatformCategory(engine: Engine, isMobile: boolean | undefined): PlatformCategory {
   if (engine === 'webkit') {
     return isMobile ? 'ios' : 'macos';
   }
-  return isMobile ? 'android' : 'windows';
+  if (isMobile) return 'android';
+  return detectHostPlatformCategory();
 }
 
 // Valeur de `navigator.platform` par plateforme. Note : "Win32" pour Windows n'est pas une
@@ -312,6 +553,9 @@ function choosePlatformCategory(engine: Engine, isMobile: boolean | undefined): 
 const PLATFORM_STRINGS: Record<PlatformCategory, string> = {
   windows: 'Win32',
   macos: 'MacIntel',
+  // Confirmé empiriquement (profil sans aucun override, cf. doc de `detectHostPlatformCategory`) :
+  // un vrai Chrome Linux x86_64 rapporte exactement cette valeur, pas "Linux i686" ni autre.
+  linux: 'Linux x86_64',
   android: 'Linux armv8l',
   ios: 'iPhone',
 };
@@ -342,18 +586,59 @@ function deriveLanguages(locale: string): string[] {
  * sérialisé tel quel par Playwright pour tourner dans la page via `context.addInitScript`.
  */
 function applyNavigatorOverrides(values: { platform: string; languages: string[] }): void {
+  // cf. doc identique dans `applyFingerprintNoise`.
+  function patchToStringNative(patchedFn: unknown, nativeStr: string): void {
+    // Découvert via bot-detector.rebrowser.net ("nativeTampering") : un `new Proxy(...)` sur
+    // `Function.prototype.toString` se détecte STRUCTURELLEMENT (ex. test de cycle sur
+    // `__proto__`), indépendamment de ce que le piège `apply` renvoie — masquer le CONTENU du
+    // `toString()` ne suffit pas si l'objet lui-même reste un Proxy repérable. On utilise donc
+    // une fonction normale fermée sur une `WeakMap` plutôt qu'un Proxy : chaque appel de
+    // `patchToStringNative` chaîne un nouveau remplaçant (fonction normale, pas Proxy) par-dessus
+    // le précédent `Function.prototype.toString` (qui, après le tout premier appel, n'est déjà
+    // plus un Proxy lui non plus), avec repli vers lui pour toute fonction non enregistrée.
+    // Syntaxe méthode (`toString(){}` dans un littéral objet) plutôt que `function(){}` : une
+    // fonction normale a une `.prototype` propre par défaut (signal de détection distinct, repéré
+    // sur `HTMLCanvasElement.toDataURL` via le même outil), une méthode n'en a pas — comme les
+    // vraies méthodes natives.
+    const prevToString = Function.prototype.toString;
+    const map = new WeakMap<object, string>();
+    const holder = {
+      toString(this: unknown) {
+        if ((typeof this === 'object' && this !== null) || typeof this === 'function') {
+          if (map.has(this as object)) return map.get(this as object)!;
+        }
+        return prevToString.call(this as Function);
+      },
+    };
+    const fakeToString = holder.toString;
+    map.set(patchedFn as object, nativeStr);
+    map.set(fakeToString, 'function toString() { [native code] }');
+    Object.defineProperty(Function.prototype, 'toString', {
+      value: fakeToString,
+      writable: true,
+      configurable: true,
+    });
+  }
+
   const proto = Object.getPrototypeOf(navigator);
+  const origPlatformGetter = Object.getOwnPropertyDescriptor(proto, 'platform')?.get;
+  const origPlatformGetterStr = origPlatformGetter ? origPlatformGetter.toString() : 'function platform() { [native code] }';
   Object.defineProperty(proto, 'platform', {
     get: () => values.platform,
     configurable: true,
     enumerable: true,
   });
+  patchToStringNative(Object.getOwnPropertyDescriptor(proto, 'platform')!.get, origPlatformGetterStr);
+
+  const origLanguagesGetter = Object.getOwnPropertyDescriptor(proto, 'languages')?.get;
+  const origLanguagesGetterStr = origLanguagesGetter ? origLanguagesGetter.toString() : 'function languages() { [native code] }';
   const frozenLanguages = Object.freeze(values.languages.slice());
   Object.defineProperty(proto, 'languages', {
     get: () => frozenLanguages,
     configurable: true,
     enumerable: true,
   });
+  patchToStringNative(Object.getOwnPropertyDescriptor(proto, 'languages')!.get, origLanguagesGetterStr);
 }
 
 interface ClientHintsProfile {
@@ -372,6 +657,10 @@ const CLIENT_HINTS_BY_PLATFORM: Record<PlatformCategory, ClientHintsProfile> = {
   android: { platform: 'Android', mobile: true, platformVersion: '14.0.0', architecture: 'arm' },
   macos: { platform: 'macOS', mobile: false, platformVersion: '14.0.0', architecture: 'arm' },
   ios: { platform: 'macOS', mobile: true, platformVersion: '17.0.0', architecture: 'arm' },
+  // `platformVersion` vide : Chromium n'a pas de notion de "version d'OS" exploitable sur Linux
+  // (contrairement à Windows/macOS/Android) — un vrai Chrome Linux envoie une chaîne vide sur
+  // `Sec-CH-UA-Platform-Version`. La remplir avec une fausse valeur serait l'incohérence inverse.
+  linux: { platform: 'Linux', mobile: false, platformVersion: '', architecture: 'x86' },
 };
 
 /**
@@ -386,7 +675,43 @@ const CLIENT_HINTS_BY_PLATFORM: Record<PlatformCategory, ClientHintsProfile> = {
  * sérialisé tel quel par Playwright pour tourner dans la page via `context.addInitScript`.
  */
 function applyClientHintsOverride(profile: ClientHintsProfile): void {
+  // cf. doc identique dans `applyFingerprintNoise`.
+  function patchToStringNative(patchedFn: unknown, nativeStr: string): void {
+    // Découvert via bot-detector.rebrowser.net ("nativeTampering") : un `new Proxy(...)` sur
+    // `Function.prototype.toString` se détecte STRUCTURELLEMENT (ex. test de cycle sur
+    // `__proto__`), indépendamment de ce que le piège `apply` renvoie — masquer le CONTENU du
+    // `toString()` ne suffit pas si l'objet lui-même reste un Proxy repérable. On utilise donc
+    // une fonction normale fermée sur une `WeakMap` plutôt qu'un Proxy : chaque appel de
+    // `patchToStringNative` chaîne un nouveau remplaçant (fonction normale, pas Proxy) par-dessus
+    // le précédent `Function.prototype.toString` (qui, après le tout premier appel, n'est déjà
+    // plus un Proxy lui non plus), avec repli vers lui pour toute fonction non enregistrée.
+    // Syntaxe méthode (`toString(){}` dans un littéral objet) plutôt que `function(){}` : une
+    // fonction normale a une `.prototype` propre par défaut (signal de détection distinct, repéré
+    // sur `HTMLCanvasElement.toDataURL` via le même outil), une méthode n'en a pas — comme les
+    // vraies méthodes natives.
+    const prevToString = Function.prototype.toString;
+    const map = new WeakMap<object, string>();
+    const holder = {
+      toString(this: unknown) {
+        if ((typeof this === 'object' && this !== null) || typeof this === 'function') {
+          if (map.has(this as object)) return map.get(this as object)!;
+        }
+        return prevToString.call(this as Function);
+      },
+    };
+    const fakeToString = holder.toString;
+    map.set(patchedFn as object, nativeStr);
+    map.set(fakeToString, 'function toString() { [native code] }');
+    Object.defineProperty(Function.prototype, 'toString', {
+      value: fakeToString,
+      writable: true,
+      configurable: true,
+    });
+  }
+
   if (!('userAgentData' in navigator)) return; // moteur sans Client Hints (webkit) : rien à faire
+  const origUaDataGetter = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(navigator), 'userAgentData')?.get;
+  const origUaDataGetterStr = origUaDataGetter ? origUaDataGetter.toString() : 'function userAgentData() { [native code] }';
   const uaMatch = navigator.userAgent.match(/Chrome\/([\d.]+)/);
   const fullVersion = uaMatch ? uaMatch[1] : '120.0.0.0';
   const majorVersion = fullVersion.split('.')[0];
@@ -436,6 +761,9 @@ function applyClientHintsOverride(profile: ClientHintsProfile): void {
     configurable: true,
     enumerable: true,
   });
+  patchToStringNative(Object.getOwnPropertyDescriptor(Object.getPrototypeOf(navigator), 'userAgentData')!.get, origUaDataGetterStr);
+  patchToStringNative(uaData.toJSON, 'function toJSON() { [native code] }');
+  patchToStringNative(uaData.getHighEntropyValues, 'function getHighEntropyValues() { [native code] }');
 
   // Expose (caché, non énumérable) les valeurs sources derrière `uaData` : `patchWorkerFingerprint`
   // et le patch réseau de Service Worker en ont besoin pour reconstruire le MÊME
@@ -477,11 +805,100 @@ function applyClientHintsOverride(profile: ClientHintsProfile): void {
  * `any` ponctuels : ce code ne s'exécute jamais côté TypeScript/Node, seul son texte sérialisé
  * tourne dans la page.
  */
+/**
+ * Remplace l'évasion `window.outerdimensions` du plugin stealth tiers (retiré, cf. commentaire
+ * au-dessus de `CHROMIUM_STEALTH_EVASIONS`/`GENERIC_STEALTH_EVASIONS` plus bas) : en mode
+ * headless, `window.outerWidth`/`outerHeight` valent 0 (pas de vraie fenêtre système), alors
+ * qu'un navigateur headED a toujours des dimensions externes non nulles (= dimensions internes +
+ * le cadre de la fenêtre). Un script de fingerprint qui compare les deux (ex. CreepJS) détecte le
+ * mode headless par cette simple absence. Pas un `new Proxy(...)` : `window.outerWidth/outerHeight`
+ * sont déjà des propriétés normales (pas des accesseurs sur le prototype comme `navigator.*`),
+ * une simple affectation directe suffit, aucune forme de masquage `toString` nécessaire.
+ *
+ * Fonction top-level pure : son code source est sérialisé tel quel par Playwright.
+ */
+function patchWindowOuterDimensions(): void {
+  try {
+    if (window.outerWidth && window.outerHeight) return;
+    const windowFrame = 85; // cadre de fenêtre typique (barre de titre/bordures), dépend de l'OS/WM
+    (window as unknown as { outerWidth: number }).outerWidth = window.innerWidth;
+    (window as unknown as { outerHeight: number }).outerHeight = window.innerHeight + windowFrame;
+  } catch {
+    // best-effort : jamais fatal pour le reste du build.
+  }
+}
+
 function patchWorkerFingerprint(): void {
+  // cf. doc identique dans `applyFingerprintNoise`.
+  function patchToStringNative(patchedFn: unknown, nativeStr: string): void {
+    // Découvert via bot-detector.rebrowser.net ("nativeTampering") : un `new Proxy(...)` sur
+    // `Function.prototype.toString` se détecte STRUCTURELLEMENT (ex. test de cycle sur
+    // `__proto__`), indépendamment de ce que le piège `apply` renvoie — masquer le CONTENU du
+    // `toString()` ne suffit pas si l'objet lui-même reste un Proxy repérable. On utilise donc
+    // une fonction normale fermée sur une `WeakMap` plutôt qu'un Proxy : chaque appel de
+    // `patchToStringNative` chaîne un nouveau remplaçant (fonction normale, pas Proxy) par-dessus
+    // le précédent `Function.prototype.toString` (qui, après le tout premier appel, n'est déjà
+    // plus un Proxy lui non plus), avec repli vers lui pour toute fonction non enregistrée.
+    // Syntaxe méthode (`toString(){}` dans un littéral objet) plutôt que `function(){}` : une
+    // fonction normale a une `.prototype` propre par défaut (signal de détection distinct, repéré
+    // sur `HTMLCanvasElement.toDataURL` via le même outil), une méthode n'en a pas — comme les
+    // vraies méthodes natives.
+    const prevToString = Function.prototype.toString;
+    const map = new WeakMap<object, string>();
+    const holder = {
+      toString(this: unknown) {
+        if ((typeof this === 'object' && this !== null) || typeof this === 'function') {
+          if (map.has(this as object)) return map.get(this as object)!;
+        }
+        return prevToString.call(this as Function);
+      },
+    };
+    const fakeToString = holder.toString;
+    map.set(patchedFn as object, nativeStr);
+    map.set(fakeToString, 'function toString() { [native code] }');
+    Object.defineProperty(Function.prototype, 'toString', {
+      value: fakeToString,
+      writable: true,
+      configurable: true,
+    });
+  }
+
+  // Un Worker a sa PROPRE portée globale (`self`), donc son propre `Function.prototype.toString`
+  // à patcher séparément du thread principal (`patchToStringNative` ci-dessus ne s'y applique
+  // pas) — ce texte est injecté tel quel en tête du bootstrap du worker. `__pts` capture et
+  // réutilise le VRAI `toString()` natif du getter qu'il remplace, lu au moment de l'exécution
+  // À L'INTÉRIEUR du worker plutôt que figé depuis le thread principal.
+  // cf. doc de `patchToStringNative` (thread principal) : même raisonnement, un `new Proxy(...)`
+  // sur `Function.prototype.toString` se détecte structurellement (indépendamment de ce qu'il
+  // renvoie), donc on utilise ici aussi une fonction normale fermée sur une `WeakMap` — et la
+  // syntaxe méthode (`toString(){}`) pour que ce remplaçant n'ait pas, lui non plus, de
+  // `.prototype` propre (contrairement à une fonction classique `function(){}`).
+  const workerToStringPatcher =
+    "(function(){var p=Function.prototype.toString;var m=new WeakMap();" +
+    "var h={toString(){if((typeof this==='object'&&this!==null)||typeof this==='function'){" +
+    "if(m.has(this))return m.get(this);}return p.call(this);}};var f=h.toString;" +
+    "m.set(f,'function toString() { [native code] }');" +
+    "Object.defineProperty(Function.prototype,'toString',{value:f,writable:true,configurable:true});" +
+    "self.__pts=function(fn,str){m.set(fn,str);};})();";
+  function workerPropPatch(propName: string, valueLiteral: string): string {
+    return (
+      `(function(){var d=Object.getOwnPropertyDescriptor(Object.getPrototypeOf(navigator),'${propName}');` +
+      `var o=d&&d.get?d.get.toString():'function ${propName}() { [native code] }';` +
+      `Object.defineProperty(Object.getPrototypeOf(navigator),'${propName}',{get:function(){return ${valueLiteral};},configurable:true});` +
+      `__pts(Object.getOwnPropertyDescriptor(Object.getPrototypeOf(navigator),'${propName}').get,o);})();`
+    );
+  }
+
   const patchParts = [
-    `Object.defineProperty(Object.getPrototypeOf(navigator), 'userAgent', { get: () => ${JSON.stringify(navigator.userAgent)}, configurable: true });`,
-    `Object.defineProperty(Object.getPrototypeOf(navigator), 'platform', { get: () => ${JSON.stringify(navigator.platform)}, configurable: true });`,
-    `Object.defineProperty(Object.getPrototypeOf(navigator), 'hardwareConcurrency', { get: () => ${navigator.hardwareConcurrency}, configurable: true });`,
+    workerToStringPatcher,
+    workerPropPatch('userAgent', JSON.stringify(navigator.userAgent)),
+    workerPropPatch('platform', JSON.stringify(navigator.platform)),
+    workerPropPatch('hardwareConcurrency', String(navigator.hardwareConcurrency)),
+    // Découvert via bot-detector.rebrowser.net ("workerConsistency") : `navigator.languages`
+    // manquait ici, donc un Worker rapportait `["fr"]` (sa propre valeur par défaut) au lieu de
+    // `["fr-FR","fr"]` comme le thread principal — repéré par comparaison directe main vs worker,
+    // pas par un test de masquage.
+    workerPropPatch('languages', JSON.stringify(navigator.languages)),
   ];
 
   // `navigator.userAgentData` (cf. doc d'`applyClientHintsOverride`) a, comme le reste, sa propre
@@ -520,7 +937,12 @@ function patchWorkerFingerprint(): void {
         'var res={};for(var i=0;i<req.length;i++){if(req[i] in full) res[req[i]]=full[req[i]];}' +
         'return Promise.resolve(res);' +
         '}};' +
+        "var d2=Object.getOwnPropertyDescriptor(Object.getPrototypeOf(navigator),'userAgentData');" +
+        "var o2=d2&&d2.get?d2.get.toString():'function userAgentData() { [native code] }';" +
         "Object.defineProperty(Object.getPrototypeOf(navigator),'userAgentData',{get:function(){return uaData;},configurable:true});" +
+        "__pts(Object.getOwnPropertyDescriptor(Object.getPrototypeOf(navigator),'userAgentData').get,o2);" +
+        "__pts(uaData.toJSON,'function toJSON() { [native code] }');" +
+        "__pts(uaData.getHighEntropyValues,'function getHighEntropyValues() { [native code] }');" +
         '})();'
     );
   }
@@ -528,6 +950,7 @@ function patchWorkerFingerprint(): void {
   const patchSource = patchParts.join('\n');
 
   function wrap(OriginalCtor: any): any {
+    const originalCtorStr = OriginalCtor.toString();
     function Patched(this: unknown, scriptURL: any, options?: any) {
       const urlString = String(scriptURL);
       let bootstrap: string;
@@ -558,6 +981,11 @@ function patchWorkerFingerprint(): void {
       return new OriginalCtor(blobUrl, options);
     }
     Patched.prototype = OriginalCtor.prototype;
+    // `.name` et `.toString()` doivent matcher le VRAI constructeur (`Worker`/`SharedWorker`) —
+    // sinon `window.Worker.name` ("Patched" au lieu de "Worker") ou son `toString()` (notre
+    // propre code source au lieu de "[native code]") trahiraient le remplacement à l'inspection.
+    Object.defineProperty(Patched, 'name', { value: OriginalCtor.name, configurable: true });
+    patchToStringNative(Patched, originalCtorStr);
     return Patched;
   }
 
@@ -606,7 +1034,14 @@ function buildClientHintsBootstrapSource(
     'var res={};for(var i=0;i<req.length;i++){if(req[i] in full) res[req[i]]=full[req[i]];}' +
     'return Promise.resolve(res);' +
     '}};' +
+    "var d2=Object.getOwnPropertyDescriptor(Object.getPrototypeOf(navigator),'userAgentData');" +
+    "var o2=d2&&d2.get?d2.get.toString():'function userAgentData() { [native code] }';" +
     "Object.defineProperty(Object.getPrototypeOf(navigator),'userAgentData',{get:function(){return uaData;},configurable:true});" +
+    "if (typeof __pts === 'function') {" +
+    "__pts(Object.getOwnPropertyDescriptor(Object.getPrototypeOf(navigator),'userAgentData').get,o2);" +
+    "__pts(uaData.toJSON,'function toJSON() { [native code] }');" +
+    "__pts(uaData.getHighEntropyValues,'function getHighEntropyValues() { [native code] }');" +
+    '}' +
     '})();'
   );
 }
@@ -622,22 +1057,82 @@ function buildClientHintsBootstrapSource(
  * dès la toute première requête. Fait notable : `Sec-CH-UA-Platform` ressortait déjà correct
  * ("Windows") sans rien faire, seul `Sec-CH-UA` porte la marque "HeadlessChrome".
  *
- * Essayé d'abord via `context.route()` (réécrire l'en-tête sortant à l'interception) : ÉCHEC
- * vérifié empiriquement sur tls.peet.ws — Chromium réinjecte sa propre valeur de `Sec-CH-UA`
- * APRÈS l'interception `Fetch`/`route.continue({headers})` sur une requête de navigation, quel
- * que soit ce qu'on lui passe. Fonctionne en revanche via `context.setExtraHTTPHeaders()`, un
- * mécanisme CDP différent et de plus bas niveau (`Network.setExtraHTTPHeaders`) — vérifié
- * empiriquement que celui-ci survit et remplace bien la valeur envoyée sur le réseau. On ne fixe
- * QUE `Sec-CH-UA` (le seul confirmé envoyé par défaut et confirmé fuyant) : son équivalent
- * haute-entropie `Sec-CH-UA-Full-Version-List` n'est envoyé que si le serveur l'a demandé via
- * `Accept-CH` — le forcer systématiquement sur CHAQUE requête (`setExtraHTTPHeaders` ne peut pas
- * être conditionnel par requête) risquerait de créer un signal inverse : un vrai navigateur
- * n'envoie jamais ce header non sollicité.
+ * Trois techniques essayées, deux écartées, l'historique compte pour ne pas les retenter :
+ *   1. `context.route()` + `route.continue({headers})` : ÉCHEC vérifié empiriquement sur
+ *      tls.peet.ws — Chromium réinjecte sa propre valeur de `Sec-CH-UA` APRÈS l'interception
+ *      `Fetch` sur une requête de navigation, quel que soit ce qu'on lui passe.
+ *   2. `context.setExtraHTTPHeaders()` : fonctionne pour une navigation DIRECTE (vérifié sur
+ *      tls.peet.ws et sur un serveur local), mais ÉCHOUE si cette navigation subit une
+ *      redirection HTTP côté serveur — vérifié empiriquement en reproduisant EXACTEMENT le cas
+ *      rencontré sur x.com (login → redirection 302 vers leur endpoint de vérification anti-bot
+ *      `/i/jf/onboarding/web`, qui répond 403) : Chromium recalcule `Sec-CH-UA` à neuf sur la
+ *      destination d'une redirection, en ignorant l'override `setExtraHTTPHeaders` posé sur la
+ *      requête d'origine. Une variante avec `route.fetch({headers})+route.fulfill()` (qui suit la
+ *      redirection lui-même) CORRIGE bien l'en-tête, mais a été écartée après vérification : elle
+ *      remplace la vraie pile réseau du navigateur par celle de Playwright pour cette requête,
+ *      changeant complètement l'empreinte TLS/JA3/JA4 (vérifié sur tls.peet.ws : hash JA3
+ *      totalement différent, `h2` absent de la négociation ALPN) — un signal de détection bien
+ *      plus grave que celui qu'on cherche à corriger. Perdre la vraie pile TLS de Chromium sur
+ *      une requête de NAVIGATION (potentiellement le document principal) n'est pas un compromis
+ *      acceptable pour corriger un simple en-tête.
+ *   3. `Network.setUserAgentOverride` via une session CDP brute (`context.newCDPSession`), avec
+ *      son paramètre `userAgentMetadata` — RETENUE : vérifié empiriquement sur le même scénario de
+ *      redirection reproduit localement que `Sec-CH-UA` ET `User-Agent` survivent tous les deux
+ *      correctement à la redirection, que `page.url()` reflète bien la destination finale (le
+ *      navigateur suit lui-même la redirection, rien n'est intercepté/reconstruit), et que la vraie
+ *      pile réseau/TLS de Chromium reste utilisée de bout en bout (ce n'est qu'une préférence
+ *      interne, pas une requête de remplacement). C'est très probablement le MÊME mécanisme que
+ *      Playwright utilise déjà en interne pour son option `userAgent` de contexte (qui, elle,
+ *      survit déjà à cette redirection sans rien faire de spécial) — on lui fournit juste le
+ *      `userAgentMetadata` qu'elle ne renseigne pas.
+ *
+ * On ne fixe QUE les champs correspondant à `Sec-CH-UA` (brands/fullVersion, confirmés fuyants) ;
+ * les champs haute-entropie (platformVersion/architecture/model/bitness/wow64) sont renseignés
+ * avec les mêmes valeurs que `CLIENT_HINTS_BY_PLATFORM`/`applyClientHintsOverride` par cohérence,
+ * mais rappel : ils ne sont exposés en HTTP que si le serveur les a demandés via `Accept-CH`.
  */
-function computeCorrectedSecChUa(ua: string): string {
+function buildUserAgentMetadata(ua: string, profile: ClientHintsProfile) {
   const uaMatch = ua.match(/Chrome\/([\d.]+)/);
-  const majorVersion = (uaMatch ? uaMatch[1] : '120.0.0.0').split('.')[0];
-  return `"Not_A Brand";v="8", "Chromium";v="${majorVersion}", "Google Chrome";v="${majorVersion}"`;
+  const fullVersion = uaMatch ? uaMatch[1] : '120.0.0.0';
+  const majorVersion = fullVersion.split('.')[0];
+  return {
+    brands: [
+      { brand: 'Not_A Brand', version: '8' },
+      { brand: 'Chromium', version: majorVersion },
+      { brand: 'Google Chrome', version: majorVersion },
+    ],
+    fullVersionList: [
+      { brand: 'Not_A Brand', version: '8.0.0.0' },
+      { brand: 'Chromium', version: fullVersion },
+      { brand: 'Google Chrome', version: fullVersion },
+    ],
+    fullVersion,
+    platform: profile.platform,
+    platformVersion: profile.platformVersion,
+    architecture: profile.architecture,
+    model: '',
+    mobile: profile.mobile,
+    bitness: '64',
+    wow64: false,
+  };
+}
+
+/**
+ * Applique `buildUserAgentMetadata` via CDP à une page donnée (cf. doc ci-dessus, technique n°3) :
+ * factorisée pour être appelée à la fois sur la page initiale et sur toute page future ouverte
+ * dans le même contexte (popup/nouvel onglet), une session CDP n'étant pas automatiquement
+ * héritée par les nouvelles pages contrairement à `context.addInitScript`.
+ */
+async function applyClientHintsCdpOverride(context: BrowserContext, page: Page, profile: ClientHintsProfile): Promise<void> {
+  // `'chromium'` en dur : cette fonction n'est appelée par `build()` QUE côté Chromium
+  // (`clientHintsProfile` vaut `null` sur webkit, cf. son appelant) — les Client Hints n'existent
+  // pas sur WebKit.
+  const ua = await mainWorldEvaluate(page, () => navigator.userAgent, 'chromium');
+  const cdp = await context.newCDPSession(page);
+  await cdp.send('Network.setUserAgentOverride', {
+    userAgent: ua,
+    userAgentMetadata: buildUserAgentMetadata(ua, profile),
+  });
 }
 
 /**
@@ -671,13 +1166,24 @@ function computeCorrectedSecChUa(ua: string): string {
 async function patchServiceWorkerFingerprint(
   context: BrowserContext,
   page: Page,
-  clientHintsProfile: ClientHintsProfile | null
+  clientHintsProfile: ClientHintsProfile | null,
+  engine: Engine
 ): Promise<void> {
-  const fp = await page.evaluate(() => ({
-    ua: navigator.userAgent,
-    platform: navigator.platform,
-    cores: navigator.hardwareConcurrency,
-  }));
+  const pageFp = await mainWorldEvaluate(
+    page,
+    () => ({
+      ua: navigator.userAgent,
+      platform: navigator.platform,
+      languages: navigator.languages,
+    }),
+    engine
+  );
+  // `cores` vient directement de `SPOOFED_HARDWARE_CONCURRENCY` (la même constante Node que
+  // `patchHardwareConcurrencyAndWebglVendor` applique à la page) plutôt que d'une lecture de
+  // `navigator.hardwareConcurrency` sur la page : vérifié empiriquement que cette lecture arrivait
+  // parfois AVANT que cette fonction n'ait eu la chance de s'appliquer sur `about:blank`, lisant
+  // encore la vraie valeur hôte — cf. doc de la constante.
+  const fp = { ...pageFp, cores: SPOOFED_HARDWARE_CONCURRENCY };
 
   let clientHints: { fullVersion: string; profile: ClientHintsProfile } | null = null;
   if (clientHintsProfile) {
@@ -695,11 +1201,47 @@ async function patchServiceWorkerFingerprint(
 
     try {
       const response = await route.fetch();
+      // Découvert en diagnostiquant une page YouTube réelle qui restait blanche (vidéo/audio
+      // natifs jouaient, mais AUCUNE UI ne s'affichait, 2026-10-26) : un vrai Service Worker de
+      // production (précaching type Workbox) ne charge pas QUE son propre script — il fait aussi
+      // des `fetch()` internes pour mettre en cache des CSS/images/JSON/polices, etc.
+      // `request.serviceWorker()` est non-null pour TOUTES ces requêtes, pas seulement le script
+      // JS du Service Worker lui-même. Sans ce garde-fou, on préfixait du JS devant N'IMPORTE
+      // QUELLE ressource récupérée par le Service Worker, y compris du CSS/JSON/images — les
+      // corrompant silencieusement (un CSS avec du JS collé devant n'est plus un CSS valide).
+      // Seules les réponses dont le Content-Type annonce vraiment du JavaScript sont concernées.
+      const contentType = response.headers()['content-type'] || '';
+      if (!/javascript|ecmascript/i.test(contentType)) {
+        await route.fulfill({ response });
+        return;
+      }
       const body = await response.text();
+      // cf. doc de `patchWorkerFingerprint` : un Service Worker a lui aussi sa propre portée
+      // globale, donc son propre `Function.prototype.toString` à patcher séparément. Même
+      // technique WeakMap + méthode plutôt que Proxy (cf. doc de `patchToStringNative`, thread
+      // principal) : un `new Proxy(...)` sur `Function.prototype.toString` se détecte
+      // structurellement, indépendamment de ce qu'il renvoie.
+      const workerToStringPatcher =
+        "(function(){var p=Function.prototype.toString;var m=new WeakMap();" +
+        "var h={toString(){if((typeof this==='object'&&this!==null)||typeof this==='function'){" +
+        "if(m.has(this))return m.get(this);}return p.call(this);}};var f=h.toString;" +
+        "m.set(f,'function toString() { [native code] }');" +
+        "Object.defineProperty(Function.prototype,'toString',{value:f,writable:true,configurable:true});" +
+        "self.__pts=function(fn,str){m.set(fn,str);};})();";
+      function swPropPatch(propName: string, valueLiteral: string): string {
+        return (
+          `(function(){var d=Object.getOwnPropertyDescriptor(Object.getPrototypeOf(navigator),'${propName}');` +
+          `var o=d&&d.get?d.get.toString():'function ${propName}() { [native code] }';` +
+          `Object.defineProperty(Object.getPrototypeOf(navigator),'${propName}',{get:function(){return ${valueLiteral};},configurable:true});` +
+          `__pts(Object.getOwnPropertyDescriptor(Object.getPrototypeOf(navigator),'${propName}').get,o);})();`
+        );
+      }
       const patchParts = [
-        `Object.defineProperty(Object.getPrototypeOf(navigator), 'userAgent', { get: () => ${JSON.stringify(fp.ua)}, configurable: true });`,
-        `Object.defineProperty(Object.getPrototypeOf(navigator), 'platform', { get: () => ${JSON.stringify(fp.platform)}, configurable: true });`,
-        `Object.defineProperty(Object.getPrototypeOf(navigator), 'hardwareConcurrency', { get: () => ${fp.cores}, configurable: true });`,
+        workerToStringPatcher,
+        swPropPatch('userAgent', JSON.stringify(fp.ua)),
+        swPropPatch('platform', JSON.stringify(fp.platform)),
+        swPropPatch('hardwareConcurrency', String(fp.cores)),
+        swPropPatch('languages', JSON.stringify(fp.languages)),
       ];
       if (clientHints) {
         patchParts.push(buildClientHintsBootstrapSource(clientHints.fullVersion, clientHints.profile));
@@ -751,6 +1293,18 @@ const FONT_WHITELISTS: Record<PlatformCategory, string[]> = {
     'Droid Sans Mono', 'Droid Serif', 'sans-serif-thin', 'sans-serif-light', 'sans-serif-medium',
     'sans-serif-black', 'Google Sans',
   ],
+  // Polices génériques les plus répandues toutes distros confondues (pas spécifiques à Kali) :
+  // Liberation (alias métriquement compatibles Arial/Times/Courier, préinstallées sur
+  // Fedora/RHEL et la plupart des distros), DejaVu (quasi universelle, défaut historique de X11),
+  // Noto (fallback Unicode large de Google, très largement packagé), Cantarell (police GNOME par
+  // défaut), Ubuntu (défaut sur les dérivées Ubuntu). Vérifié via `fc-list` sur cette machine que
+  // Liberation/DejaVu/Noto/Cantarell y sont bien réellement installées.
+  linux: [
+    'DejaVu Sans', 'DejaVu Sans Mono', 'DejaVu Serif', 'Liberation Sans', 'Liberation Sans Narrow',
+    'Liberation Serif', 'Liberation Mono', 'Noto Sans', 'Noto Serif', 'Noto Sans Mono',
+    'Noto Color Emoji', 'Cantarell', 'Ubuntu', 'Ubuntu Mono', 'FreeSans', 'FreeSerif', 'FreeMono',
+    'Droid Sans Fallback',
+  ],
   ios: [
     'Helvetica Neue', 'Helvetica', 'Arial', 'Courier New', 'Georgia', 'Times New Roman',
     'Trebuchet MS', 'Verdana', 'American Typewriter', 'Avenir', 'Avenir Next', 'Baskerville',
@@ -772,6 +1326,42 @@ const FONT_WHITELISTS: Record<PlatformCategory, string[]> = {
  * sérialisé tel quel par Playwright pour tourner dans la page via `context.addInitScript`.
  */
 function applyFontFingerprintDefense(allowedFonts: string[]): void {
+  // cf. doc identique dans `applyFingerprintNoise` — dupliquée ici car chaque fonction
+  // top-level enregistrée via `context.addInitScript` doit être autonome (son code source est
+  // sérialisé tel quel, sans accès aux autres fonctions top-level du fichier).
+  function patchToStringNative(patchedFn: unknown, nativeStr: string): void {
+    // Découvert via bot-detector.rebrowser.net ("nativeTampering") : un `new Proxy(...)` sur
+    // `Function.prototype.toString` se détecte STRUCTURELLEMENT (ex. test de cycle sur
+    // `__proto__`), indépendamment de ce que le piège `apply` renvoie — masquer le CONTENU du
+    // `toString()` ne suffit pas si l'objet lui-même reste un Proxy repérable. On utilise donc
+    // une fonction normale fermée sur une `WeakMap` plutôt qu'un Proxy : chaque appel de
+    // `patchToStringNative` chaîne un nouveau remplaçant (fonction normale, pas Proxy) par-dessus
+    // le précédent `Function.prototype.toString` (qui, après le tout premier appel, n'est déjà
+    // plus un Proxy lui non plus), avec repli vers lui pour toute fonction non enregistrée.
+    // Syntaxe méthode (`toString(){}` dans un littéral objet) plutôt que `function(){}` : une
+    // fonction normale a une `.prototype` propre par défaut (signal de détection distinct, repéré
+    // sur `HTMLCanvasElement.toDataURL` via le même outil), une méthode n'en a pas — comme les
+    // vraies méthodes natives.
+    const prevToString = Function.prototype.toString;
+    const map = new WeakMap<object, string>();
+    const holder = {
+      toString(this: unknown) {
+        if ((typeof this === 'object' && this !== null) || typeof this === 'function') {
+          if (map.has(this as object)) return map.get(this as object)!;
+        }
+        return prevToString.call(this as Function);
+      },
+    };
+    const fakeToString = holder.toString;
+    map.set(patchedFn as object, nativeStr);
+    map.set(fakeToString, 'function toString() { [native code] }');
+    Object.defineProperty(Function.prototype, 'toString', {
+      value: fakeToString,
+      writable: true,
+      configurable: true,
+    });
+  }
+
   const allowed = new Set(allowedFonts.map((f) => f.toLowerCase()));
   const GENERIC = new Set([
     'serif', 'sans-serif', 'monospace', 'cursive', 'fantasy', 'system-ui', '-apple-system',
@@ -789,23 +1379,31 @@ function applyFontFingerprintDefense(allowedFonts: string[]): void {
   }
 
   const origMeasureText = CanvasRenderingContext2D.prototype.measureText;
-  CanvasRenderingContext2D.prototype.measureText = function (this: CanvasRenderingContext2D, text: string) {
-    const families = parseFamilies(this.font);
-    const requested = families[0];
-    if (requested && !isAllowed(requested)) {
-      const genericFallback = families.find((f) => GENERIC.has(f.toLowerCase())) || 'sans-serif';
-      const savedFont = this.font;
-      this.font = this.font.replace(requested, genericFallback);
-      const result = origMeasureText.call(this, text);
-      this.font = savedFont;
-      return result;
-    }
-    return origMeasureText.call(this, text);
-  };
+  const origMeasureTextStr = origMeasureText.toString();
+  CanvasRenderingContext2D.prototype.measureText = {
+    measureText(this: CanvasRenderingContext2D, text: string) {
+      const families = parseFamilies(this.font);
+      const requested = families[0];
+      if (requested && !isAllowed(requested)) {
+        const genericFallback = families.find((f) => GENERIC.has(f.toLowerCase())) || 'sans-serif';
+        const savedFont = this.font;
+        this.font = this.font.replace(requested, genericFallback);
+        const result = origMeasureText.call(this, text);
+        this.font = savedFont;
+        return result;
+      }
+      return origMeasureText.call(this, text);
+    },
+  }.measureText;
+  patchToStringNative(CanvasRenderingContext2D.prototype.measureText, origMeasureTextStr);
 
   const fontsSet = (document as any).fonts;
   if (fontsSet && typeof fontsSet.check === 'function') {
     const origCheck = fontsSet.check.bind(fontsSet);
+    // `document.fonts.check` est une propriété d'INSTANCE (pas `FontFaceSet.prototype.check`,
+    // qui reste intact et natif) — capturer son `toString()` avant écrasement reste la bonne
+    // approche, juste sur cet objet précis plutôt que sur un prototype partagé.
+    const origCheckStr = fontsSet.check.toString();
     fontsSet.check = function (fontCss: string, text?: string) {
       const requested = parseFamilies(fontCss)[0];
       if (requested && !isAllowed(requested)) {
@@ -813,58 +1411,103 @@ function applyFontFingerprintDefense(allowedFonts: string[]): void {
       }
       return origCheck(fontCss, text);
     };
+    patchToStringNative(fontsSet.check, origCheckStr);
   }
 }
 
-// `user-agent-override` est exclue même côté Chromium (elle est activée par défaut dans le
-// jeu complet du plugin) : elle recalcule sa propre valeur à partir de l'UA brut du
-// navigateur (avec un masquage Linux -> Windows) sans connaître l'UA explicite que
-// `pickDeviceConfig` fixe déjà pour chaque device (ex. Android), et l'écrase donc via son
-// override CDP. Vérifié empiriquement : avec cette évasion active, un device 'Pixel 7'
-// ressortait avec un UA desktop Windows au lieu de l'UA Android attendu. Playwright gère déjà
-// nativement l'UA (et l'en-tête HTTP associé) via l'option de contexte `userAgent` qu'on
-// passe nous-mêmes — pas besoin de cette évasion pour ça.
-// `navigator.languages` est exclue aussi (cf. doc de `applyNavigatorOverrides`) : sa valeur par
-// défaut ('en-US','en') est fixe au niveau du plugin, indépendante de la vraie `locale` du
-// profil — vérifié empiriquement, un profil `locale: 'fr-FR'` ressortait quand même avec
-// `navigator.languages: ['en-US','en']`, en désaccord avec son propre `navigator.language`.
-const CHROMIUM_STEALTH_EVASIONS = new Set(
-  [...stealth().availableEvasions].filter((e) => e !== 'user-agent-override' && e !== 'navigator.languages')
-);
-chromium.use(stealth({ enabledEvasions: CHROMIUM_STEALTH_EVASIONS }));
+// Valeur de `navigator.hardwareConcurrency` posée par `patchHardwareConcurrencyAndWebglVendor`
+// ci-dessous — même défaut que l'évasion du plugin stealth qu'elle remplace. Exposée en
+// constante Node (pas juste un littéral dans la fonction sérialisée) pour que
+// `patchServiceWorkerFingerprint`, plus bas, puisse réutiliser la MÊME valeur directement plutôt
+// que de la relire sur `navigator.hardwareConcurrency` depuis Node — vérifié empiriquement que
+// cette lecture arrive parfois AVANT que cette fonction n'ait eu la chance de s'appliquer sur la
+// page encore vierge (`about:blank`), une course différente de celle déjà documentée ailleurs
+// dans ce fichier pour `__stealthClientHints`, mais de la même famille.
+const SPOOFED_HARDWARE_CONCURRENCY = 4;
 
-// `puppeteer-extra-plugin-stealth` a été écrit pour faire passer un Chromium headless pour
-// un Chromium standard : plusieurs de ses évasions injectent ou imitent des artefacts propres
-// à Chrome. Les appliquer telles quelles sur WebKit (utilisé ici pour les presets iOS/Safari,
-// voir `pickDeviceConfig`) serait contre-productif — un vrai Safari n'a jamais ces artefacts,
-// donc les ajouter crée un signal de détection au lieu d'en effacer un :
-//   - chrome.app / chrome.csi / chrome.loadTimes / chrome.runtime injectent un objet
-//     `window.chrome`, inexistant sur Safari.
-//   - navigator.plugins mock la liste de plugins de Chrome (Chrome PDF Plugin, Native
-//     Client...), absente sur Safari.
-//   - iframe.contentWindow corrige un bug spécifique au moteur Blink.
-//   - defaultArgs nettoie des flags de lancement propres à Chromium.
-//   - sourceurl / user-agent-override pilotent Chrome DevTools Protocol (CDP). WebKit ne
-//     parle pas CDP : playwright-extra leur renvoie un client CDP factice (no-op), donc pas
-//     de crash, mais pas d'effet non plus — autant ne pas les charger. Le cas de
-//     user-agent-override est de toute façon couvert nativement par l'option `userAgent` du
-//     device Playwright passée à `launchPersistentContext`.
-// On ne garde donc que les évasions génériques, qui patchent des propriétés JS standard
-// (navigator.*, WebGL, dimensions de fenêtre) sans halluciner d'API propre à Chrome.
-// `navigator.webdriver` est traité à part (cf. `build()`) : la version packagée pousse un
-// flag de lancement Chromium (--disable-blink-features=AutomationControlled) qu'on ne veut
-// pas envoyer à WebKit, dont le comportement avec ce flag n'est pas garanti.
-// `navigator.languages` exclue pour la même raison que côté Chromium (cf. commentaire sur
-// `CHROMIUM_STEALTH_EVASIONS` et doc de `applyNavigatorOverrides`) : valeur figée par le plugin,
-// indépendante de la vraie `locale` du profil.
-const GENERIC_STEALTH_EVASIONS = new Set([
-  'navigator.hardwareConcurrency',
-  'navigator.permissions',
-  'webgl.vendor',
-  'media.codecs',
-  'window.outerdimensions',
-]);
-webkit.use(stealth({ enabledEvasions: GENERIC_STEALTH_EVASIONS }));
+/**
+ * Réimplémente nous-mêmes DEUX évasions du plugin stealth tiers — `navigator.hardwareConcurrency`
+ * et `webgl.vendor` — découvert via bot-detector.rebrowser.net ("nativeTampering") : leurs
+ * versions internes enveloppent les fonctions patchées dans un VRAI `new Proxy(...)`
+ * (`utils.replaceGetterWithProxy`/`utils.replaceWithProxy`), détectable structurellement (test de
+ * cycle sur `__proto__`) INDÉPENDAMMENT de ce que `toString()` renvoie — notre propre
+ * `patchToStringNative` (basé sur une fonction normale + `WeakMap`, jamais un Proxy) ne peut rien
+ * y faire puisque le problème n'est pas le contenu du `toString()`, c'est la nature structurelle
+ * de l'objet lui-même. Seule option : ne pas utiliser ces deux évasions du plugin (exclues plus
+ * bas de `CHROMIUM_STEALTH_EVASIONS`) et les reproduire ici avec nos propres fonctions normales
+ * (syntaxe méthode, jamais de Proxy), mêmes valeurs par défaut que le plugin pour ne rien changer
+ * d'observable : `hardwareConcurrency` (cf. `SPOOFED_HARDWARE_CONCURRENCY`), vendor
+ * `"Intel Inc."`, renderer `"Intel Iris OpenGL Engine"` (cf.
+ * `node_modules/puppeteer-extra-plugin-stealth/evasions/navigator.hardwareConcurrency` et
+ * `.../webgl.vendor`).
+ *
+ * Fonction top-level pure : son code source est sérialisé tel quel par Playwright.
+ */
+function patchHardwareConcurrencyAndWebglVendor(hardwareConcurrency: number): void {
+  function patchToStringNative(patchedFn: unknown, nativeStr: string): void {
+    const prevToString = Function.prototype.toString;
+    const map = new WeakMap<object, string>();
+    const holder = {
+      toString(this: unknown) {
+        if ((typeof this === 'object' && this !== null) || typeof this === 'function') {
+          if (map.has(this as object)) return map.get(this as object)!;
+        }
+        return prevToString.call(this as Function);
+      },
+    };
+    const fakeToString = holder.toString;
+    map.set(patchedFn as object, nativeStr);
+    map.set(fakeToString, 'function toString() { [native code] }');
+    Object.defineProperty(Function.prototype, 'toString', {
+      value: fakeToString,
+      writable: true,
+      configurable: true,
+    });
+  }
+
+  const proto = Object.getPrototypeOf(navigator);
+  const origHwcGetter = Object.getOwnPropertyDescriptor(proto, 'hardwareConcurrency')?.get;
+  const origHwcGetterStr = origHwcGetter ? origHwcGetter.toString() : 'function hardwareConcurrency() { [native code] }';
+  Object.defineProperty(proto, 'hardwareConcurrency', {
+    get: { hardwareConcurrency: () => hardwareConcurrency }.hardwareConcurrency,
+    configurable: true,
+    enumerable: true,
+  });
+  patchToStringNative(Object.getOwnPropertyDescriptor(proto, 'hardwareConcurrency')!.get, origHwcGetterStr);
+
+  function patchGetParameter(ctor: { prototype: Record<string, any> } | undefined): void {
+    if (!ctor) return;
+    const origGetParameter = ctor.prototype.getParameter;
+    const origGetParameterStr = origGetParameter.toString();
+    ctor.prototype.getParameter = {
+      getParameter(this: unknown, param: number) {
+        if (param === 37445) return 'Intel Inc.'; // UNMASKED_VENDOR_WEBGL
+        if (param === 37446) return 'Intel Iris OpenGL Engine'; // UNMASKED_RENDERER_WEBGL
+        return origGetParameter.call(this, param);
+      },
+    }.getParameter;
+    patchToStringNative(ctor.prototype.getParameter, origGetParameterStr);
+  }
+  patchGetParameter(typeof WebGLRenderingContext !== 'undefined' ? WebGLRenderingContext : undefined);
+  patchGetParameter(typeof WebGL2RenderingContext !== 'undefined' ? WebGL2RenderingContext : undefined);
+}
+
+// `puppeteer-extra-plugin-stealth` (et `playwright-extra`) ont été retirés du projet : découvert
+// via bot-detector.rebrowser.net ("nativeTampering") que son évasion `iframe.contentWindow` est
+// désormais reconnue NOMMÉMENT par cet outil ("That's the iframe.contentWindow evasion of
+// puppeteer-extra-plugin-stealth") — ce n'est plus un correctif discret, c'est une signature.
+// Plusieurs autres évasions du plugin (`navigator.permissions`, `media.codecs`, déjà exclues
+// avant côté `navigator.hardwareConcurrency`/`webgl.vendor`) s'appuient aussi sur
+// `new Proxy(...)` en interne, détectable structurellement pour la même raison documentée sur
+// `patchHardwareConcurrencyAndWebglVendor`. Plutôt que de patcher autour de ces fuites une à une,
+// on s'appuie désormais sur le fait que Chromium est lancé via `channel: 'chrome'` (vrai Google
+// Chrome installé, pas un Chromium nu) : la plupart des artefacts que le plugin fabriquait
+// (`window.chrome.app/runtime/csi/loadTimes`, `navigator.plugins`, support des codecs
+// propriétaires) sont déjà NATIVEMENT présents sur un vrai Chrome, pas besoin de les imiter.
+// Seule exception identifiée nécessitant un correctif de remplacement :
+// `window.outerWidth`/`outerHeight`, vides en mode headless sur les deux moteurs — cf.
+// `patchWindowOuterDimensions` plus bas (réimplémentation sans Proxy).
+// `navigator.webdriver` reste traité à part dans `build()`/`healthCheck()`, inchangé.
 
 export interface ProxyConfig {
   server: string;
@@ -946,27 +1589,127 @@ const DESKTOP_VIEWPORTS = [
   { width: 1920, height: 1080 },
 ];
 
-// Utilisée uniquement pour le fallback 'desktop' en headless (cf. `pickDeviceConfig`) : sans
-// UA explicite, Chromium headless annonce littéralement `HeadlessChrome/…` (et son hôte Linux)
-// dans l'UA — un signal évident. On ne peut plus compter sur l'évasion `user-agent-override`
-// du plugin stealth pour nettoyer ça (cf. commentaire sur `CHROMIUM_STEALTH_EVASIONS`), donc on
-// construit nous-mêmes un UA desktop plausible (masqué en Windows, comme le ferait cette
-// évasion), avec la vraie version de Chromium embarqué pour rester cohérent avec les client
-// hints. Un seul lancement/fermeture de navigateur, mis en cache pour tout le process.
-let cachedHeadlessDesktopUserAgent: Promise<string> | null = null;
-async function getHeadlessDesktopUserAgent(): Promise<string> {
-  if (!cachedHeadlessDesktopUserAgent) {
-    cachedHeadlessDesktopUserAgent = (async () => {
-      const browser = await chromium.launch({ headless: true });
+// Liste EXACTE du `--disable-features=...` que Playwright pose par défaut sur le Chromium qu'il
+// lance, lue directement sur la ligne de commande du process réellement démarré (`/proc/<pid>/
+// cmdline`) — aucune autre source fiable pour cette chaîne (construite dynamiquement en interne,
+// jamais exposée telle quelle par l'API publique). Utilisée dans `build()` pour retirer ce
+// `--disable-features=...` par défaut via `ignoreDefaultArgs` (nécessite une correspondance EXACTE
+// de la chaîne) et le reposer nous-mêmes sans `ThirdPartyStoragePartitioning` (cf. doc sur
+// l'appel à `launchPersistentContext`). Fragile par construction : si une future version de
+// Playwright change cette liste, `ignoreDefaultArgs` ne matchera plus et ce `--disable-features=`
+// par défaut réapparaîtra tel quel (pas d'échec silencieux dangereux, juste la régression
+// `ThirdPartyStoragePartitioning` qui revient — repérable via bot-detector.rebrowser.net).
+const PLAYWRIGHT_DEFAULT_DISABLED_FEATURES = [
+  'AvoidUnnecessaryBeforeUnloadCheckSync',
+  'DestroyProfileOnBrowserClose',
+  'DialMediaRouteProvider',
+  'GlobalMediaControls',
+  'HttpsUpgrades',
+  'LensOverlay',
+  'MediaRouter',
+  'PaintHolding',
+  'ThirdPartyStoragePartitioning',
+  'BlockOriginHeaderModificationOnRedirect',
+  'Translate',
+  'AutoDeElevate',
+  'OptimizationHints',
+  'msForceBrowserSignIn',
+  'msEdgeUpdateLaunchServicesPreferredVersion',
+];
+
+// Gabarit du segment "système" de l'UA desktop, un par plateforme host détectable (cf.
+// `detectHostPlatformCategory`) — pas de `linux`/`macos`/`windows` à choisir manuellement, ce
+// segment doit toujours correspondre au VRAI système d'exploitation que le profil prétend être,
+// jamais un autre (cf. doc de `detectHostPlatformCategory` sur `platformMismatch`).
+const DESKTOP_UA_OS_SEGMENT: Record<'windows' | 'macos' | 'linux', string> = {
+  windows: 'Windows NT 10.0; Win64; x64',
+  macos: 'Macintosh; Intel Mac OS X 10_15_7',
+  linux: 'X11; Linux x86_64',
+};
+
+// Utilisée pour le fallback 'desktop' dans `pickDeviceConfig`, QUE le lancement soit headless ou
+// non — découvert en testant un profil headED contre pixelscan.net/fingerprint-check ("Masking
+// detected", "Chrome 85 or below") : sans UA explicite, Chromium rapporte son VRAI UA, qui
+// révèle littéralement le host (`X11; Linux x86_64`) — en mode headless, il y ajoute même
+// littéralement `HeadlessChrome/…`. Ce correctif ciblait à l'origine seulement ce deuxième cas
+// (le plus visible), mais le premier existe tout autant en mode headED : `navigator.platform`
+// est déjà écrasé par `applyNavigatorOverrides` (qui s'applique sans condition de headless) pour
+// correspondre à la plateforme DÉTECTÉE, donc sans UA cohérent, un profil headED se contredirait
+// lui-même — exactement le genre d'incohérence qu'un vérificateur de fingerprint sérieux détecte.
+// On construit nous-mêmes un UA desktop plausible pour la plateforme réellement détectée (cf.
+// `DESKTOP_UA_OS_SEGMENT`), avec la vraie version de Chrome installé pour rester cohérent avec les
+// Client Hints. Un seul lancement/fermeture de navigateur par plateforme (toujours en headless,
+// peu importe le mode demandé par l'appelant — on a juste besoin de lire la version), mis en cache
+// pour tout le process — en pratique une seule entrée sera jamais remplie, le host ne change pas
+// en cours de route, mais garder la fonction paramétrable plutôt qu'un singleton évite de devoir
+// la retoucher si un jour un même process devait servir plusieurs plateformes.
+const cachedDesktopUserAgents = new Map<'windows' | 'macos' | 'linux', Promise<string>>();
+async function getDesktopUserAgent(platform: 'windows' | 'macos' | 'linux'): Promise<string> {
+  let cached = cachedDesktopUserAgents.get(platform);
+  if (!cached) {
+    cached = (async () => {
+      // `channel: 'chrome'` : même raison que sur le lancement principal dans `build()` (cf. sa
+      // doc) — on lit la version du VRAI Chrome installé sur la machine, pas celle du Chromium
+      // embarqué par Playwright ("Chrome for Testing"). Sans ce flag ici, cette fonction lirait
+      // une version DIFFÉRENTE de celle du navigateur réellement lancé (le `channel` change aussi
+      // la version, pas seulement le nom) — un UA spoofé avec une version Chrome qui ne
+      // correspond pas au vrai moteur serait une incohérence auto-infligée.
+      const browser = await chromium.launch({ headless: true, channel: 'chrome' });
       try {
         const version = await browser.version();
-        return `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${version} Safari/537.36`;
+        return `Mozilla/5.0 (${DESKTOP_UA_OS_SEGMENT[platform]}) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${version} Safari/537.36`;
       } finally {
         await browser.close();
       }
     })();
+    cachedDesktopUserAgents.set(platform, cached);
   }
-  return cachedHeadlessDesktopUserAgent;
+  return cached;
+}
+
+/**
+ * Découverte en testant contre pixelscan.net/fingerprint-check (avec un profil passant par un
+ * proxy) : résultat "Masking detected" / "Timezone spoofed" — pas un défaut des techniques de
+ * masquage JS de ce fichier (confirmé en inspectant le détail du rapport), mais une incohérence
+ * géographique toute bête : `timezoneId` vaut par défaut `'Europe/Paris'` (cf. constructeur),
+ * sans AUCUN rapport avec le pays de sortie réel du proxy configuré. Pixelscan compare le fuseau
+ * annoncé par le JS à l'heure dérivée de la géolocalisation de l'IP et signale l'écart — un vrai
+ * utilisateur n'a quasiment jamais un fuseau différent de sa position réseau réelle.
+ *
+ * Résout le fuseau IANA (ex. `"Africa/Porto-Novo"`) correspondant à l'IP de SORTIE du proxy
+ * fourni, via l'API gratuite ip-api.com, elle-même appelée à TRAVERS ce proxy (sinon on
+ * géolocaliserait notre propre IP, pas celle que verra le site cible). Best-effort : `null` en
+ * cas d'échec (API injoignable, proxy mort, timeout, réponse inattendue) — jamais fatal, cf.
+ * l'appelant dans `build()`, qui retombe alors sur `this.timezoneId` (défaut ou valeur fournie).
+ *
+ * Passe par un vrai navigateur headless jetable (`chromium.launch`) plutôt que
+ * `request.newContext()` (le client HTTP léger de Playwright, indépendant d'un vrai processus
+ * navigateur) : vérifié empiriquement que ce client léger ne sort tout simplement pas sur le
+ * réseau dans cet environnement de dev (timeout systématique, y compris SANS proxy, vers un site
+ * pourtant atteignable sans problème via `page.goto()`) — un vrai navigateur est donc plus
+ * robuste ici, en plus de reproduire fidèlement la même sémantique réseau/proxy que le contexte
+ * final.
+ */
+async function resolveTimezoneFromProxy(proxy: ProxyConfig): Promise<string | null> {
+  let browser: Browser | undefined;
+  try {
+    browser = await chromium.launch({
+      headless: true,
+      proxy: { server: proxy.server, username: proxy.username, password: proxy.password },
+    });
+    const page = await browser.newPage();
+    await page.goto('http://ip-api.com/json/?fields=status,timezone', { timeout: 8000 });
+    const text = await page.evaluate(() => document.body.innerText);
+    const data = JSON.parse(text) as { status?: string; timezone?: string };
+    if (data.status === 'success' && typeof data.timezone === 'string' && data.timezone) {
+      return data.timezone;
+    }
+    return null;
+  } catch {
+    return null;
+  } finally {
+    await browser?.close().catch(() => {});
+  }
 }
 
 export class DriverBuilder {
@@ -981,6 +1724,11 @@ export class DriverBuilder {
   private device: NonNullable<DriverBuilderOptions['device']>;
   private locale: string;
   private timezoneId: string;
+  // Distingue "valeur par défaut" de "fournie explicitement par l'appelant" : sert à ne
+  // déclencher la détection auto du fuseau via le proxy (cf. `resolveTimezoneFromProxy`) que
+  // lorsque l'appelant n'a PAS déjà choisi un `timezoneId` lui-même, pour ne jamais écraser une
+  // intention explicite.
+  private timezoneIdExplicit: boolean;
 
   constructor(opts: DriverBuilderOptions = {}) {
     if (opts.proxy && opts.proxyRotator) {
@@ -997,6 +1745,7 @@ export class DriverBuilder {
     this.device = opts.device ?? 'desktop';
     this.locale = opts.locale ?? 'fr-FR';
     this.timezoneId = opts.timezoneId ?? 'Europe/Paris';
+    this.timezoneIdExplicit = opts.timezoneId !== undefined;
 
     // Inutile de préparer un dossier de base éphémère si on ne s'en servira jamais (chemin
     // fixe fourni).
@@ -1026,18 +1775,45 @@ export class DriverBuilder {
     const engine = resolveEngineForDevice(this.device);
     if (this.device === 'desktop') {
       const viewport = DESKTOP_VIEWPORTS[Math.floor(Math.random() * DESKTOP_VIEWPORTS.length)];
-      const userAgent = this.headless ? await getHeadlessDesktopUserAgent() : undefined;
+      const userAgent = await getDesktopUserAgent(detectHostPlatformCategory());
       return {
         engine,
-        viewport,
+        // `viewport: null` plutôt qu'une taille fixe : repéré en utilisant un profil à la main,
+        // redimensionner la fenêtre ne changeait RIEN à ce que la page voit — Playwright impose
+        // normalement une taille de viewport FIGÉE via une émulation CDP (`Emulation.
+        // setDeviceMetricsOverride`), indépendante de la vraie fenêtre, pour la reproductibilité
+        // des tests. Un vrai navigateur, lui, voit TOUJOURS sa fenêtre réelle, qui suit le
+        // redimensionnement — `viewport: null` désactive cette émulation. La taille choisie plus
+        // haut sert plutôt de taille INITIALE de fenêtre, via `--window-size` (cf. `build()`) :
+        // la variété entre profils est gardée, mais la fenêtre redevient redimensionnable comme
+        // chez un vrai utilisateur. Uniquement pour 'desktop' : un preset mobile (ex. 'Pixel 7')
+        // garde son viewport FIXE intentionnellement, un vrai téléphone n'a pas une taille
+        // d'écran qu'un utilisateur peut faire varier en tirant sur une fenêtre.
+        viewport: null,
+        windowSize: viewport,
         isMobile: false,
         hasTouch: false,
-        ...(userAgent ? { userAgent } : {}),
+        userAgent,
       };
     }
     // `resolveEngineForDevice` a déjà validé que ce device existe et n'est pas un preset
     // Firefox, donc `preset` est forcément défini ici.
     const { defaultBrowserType, ...deviceConfig } = playwrightDevices[this.device];
+    if (!deviceConfig.isMobile) {
+      // Découvert en testant 'Desktop Safari' contre bot-detector.rebrowser.net ("viewport",
+      // 2026-10-26) : même raisonnement que pour 'desktop' ci-dessus (viewport CDP/WebKit figé,
+      // indépendant de la vraie fenêtre), appliqué à TOUT preset desktop, pas seulement notre
+      // 'desktop' maison — un 'Desktop Safari' a, comme un vrai Mac, une fenêtre réellement
+      // redimensionnable. Pas de `windowSize`/`--window-size` ici (mécanisme Chromium-only, cf.
+      // `build()`, et sans équivalent CLI sur WebKit) : `viewport: null` suffit à désactiver
+      // l'émulation figée, la fenêtre s'ouvre avec la taille par défaut du moteur puis reste
+      // redimensionnable — vérifié empiriquement que ça suffit à faire passer le test au vert.
+      // `deviceScaleFactor` retiré du spread : Playwright refuse explicitement sa combinaison avec
+      // `viewport: null` (`"deviceScaleFactor" option is not supported with null "viewport"`,
+      // trouvé en testant) — repli sur le défaut (1) du moteur, comme pour 'desktop' plus haut.
+      const { deviceScaleFactor: _deviceScaleFactor, ...deviceConfigWithoutScale } = deviceConfig;
+      return { engine, ...deviceConfigWithoutScale, viewport: null };
+    }
     return { engine, ...deviceConfig };
   }
 
@@ -1059,7 +1835,7 @@ export class DriverBuilder {
       let proxy: ProxyConfig | undefined;
       let context: BrowserContext | undefined;
       try {
-        const { engine, ...deviceConfig } = await this.pickDeviceConfig();
+        const { engine, windowSize, ...deviceConfig } = await this.pickDeviceConfig();
         const launcher = engine === 'webkit' ? webkit : chromium;
         proxy = this.proxyRotator ? this.proxyRotator.next(this.proxyStickyKey) : this.proxy;
 
@@ -1069,6 +1845,18 @@ export class DriverBuilder {
         const engineArgs =
           engine === 'chromium'
             ? {
+                // Découvert en testant un profil headED à l'oeil nu (chrome://version/about
+                // Chrome) : SANS ce `channel`, Playwright lance son propre Chromium embarqué, qui
+                // s'identifie littéralement comme "Google Chrome for Testing" — un build Google
+                // distribué spécifiquement pour l'automatisation/CI, PAS pour un usage humain
+                // normal, avec des composants retirés (notamment Widevine/DRM — explique une
+                // erreur de lecture YouTube constatée). C'est visible à l'oeil (chrome://version)
+                // ET potentiellement par des services Google eux-mêmes (reCAPTCHA plus agressif
+                // constaté sur la même session) qui ont tout loisir de reconnaître leur propre
+                // build de test. `channel: 'chrome'` lance le VRAI Google Chrome installé sur la
+                // machine à la place — même moteur Blink, mais le bon nom de produit. Nécessite
+                // un vrai Chrome installé sur l'hôte (`npx playwright install chrome` sinon).
+                channel: 'chrome',
                 args: [
                   '--no-sandbox',
                   '--disable-dev-shm-usage',
@@ -1082,19 +1870,75 @@ export class DriverBuilder {
                   // Chromium, complémentaire à `blockWebRtcLeaks` (cf. driverBuilder.ts) qui
                   // couvre en plus WebKit, sans équivalent en ligne de commande.
                   '--force-webrtc-ip-handling-policy=disable_non_proxied_udp',
+                  // Taille INITIALE de la fenêtre pour le profil 'desktop' (cf. doc de
+                  // `pickDeviceConfig`) : remplace le viewport figé par une vraie taille de
+                  // fenêtre, redimensionnable comme chez un vrai utilisateur. Absent pour un
+                  // preset device (mobile/tablette), qui garde son viewport fixe intentionnel.
+                  ...(windowSize ? [`--window-size=${windowSize.width},${windowSize.height}`] : []),
+                  // Découvert via bot-detector.rebrowser.net ("storagePartitioning") : Playwright
+                  // désactive par défaut le partitionnement de stockage tiers
+                  // (`--disable-features=...ThirdPartyStoragePartitioning...`), ce qui permet à
+                  // une iframe d'un AUTRE site de lire le localStorage de CETTE page — un vrai
+                  // navigateur l'empêche. Un `--enable-features=ThirdPartyStoragePartitioning`
+                  // séparé ne suffit PAS à contrer ça : vérifié empiriquement en inspectant la
+                  // ligne de commande réelle du process Chromium lancé, Playwright pose SON PROPRE
+                  // `--enable-features=CDPScreenshotNewSurface` distinct du nôtre (deux
+                  // occurrences du même switch, pas une fusion), et le résultat du test restait
+                  // négatif malgré notre ajout. On retire donc le `--disable-features=...` complet
+                  // de Playwright via `ignoreDefaultArgs` (la chaîne EXACTE qu'il pose,
+                  // lue directement depuis la ligne de commande du process lancé) et on repose
+                  // la MÊME liste nous-mêmes, juste sans `ThirdPartyStoragePartitioning`.
+                  `--disable-features=${PLAYWRIGHT_DEFAULT_DISABLED_FEATURES.filter((f) => f !== 'ThirdPartyStoragePartitioning').join(',')}`,
+                ],
+                // Toujours via bot-detector.rebrowser.net ("popupBlocking", "ipcFloodingProtection",
+                // "storagePartitioning") : des flags par défaut de PLAYWRIGHT lui-même (pas les
+                // nôtres) rendent un comportement détectable — Chrome bloque normalement les
+                // popups non déclenchés par un clic, limite les appels IPC rapides (ex.
+                // `history.replaceState` en boucle), et partitionne le stockage par site tiers ;
+                // Playwright désactive les trois par défaut pour simplifier l'automatisation. On
+                // les retire explicitement de la liste de défauts plutôt que de les laisser
+                // s'appliquer (le `--disable-features=...` par défaut est retiré ici ET reposé
+                // juste au-dessus, sans `ThirdPartyStoragePartitioning`).
+                // `--disable-sync` retiré aussi (repéré en utilisant un profil à l'oeil : le menu
+                // sélecteur de profil affichait "Votre Chromium" au lieu de "Votre Chrome") : un
+                // vrai Chrome jamais connecté a la synchro ACTIVÉE par défaut (juste inactive,
+                // faute de compte) — `--disable-sync` est donc lui-même l'écart par rapport à un
+                // vrai navigateur, pas l'inverse. Vérifié empiriquement sans ce flag : aucune
+                // invite de connexion ni popup intempestif (`chrome://sync-internals` confirme un
+                // état "Disabled / Not signed in" parfaitement normal), donc rien à perdre à le
+                // retirer — contrairement à une première intuition, à tort trop prudente, qui n'a
+                // pas résisté à la vérification.
+                ignoreDefaultArgs: [
+                  '--disable-popup-blocking',
+                  '--disable-ipc-flooding-protection',
+                  '--disable-sync',
+                  `--disable-features=${PLAYWRIGHT_DEFAULT_DISABLED_FEATURES.join(',')}`,
                 ],
               }
             : {};
 
+        // Fuseau horaire aligné sur la sortie réelle du proxy (cf. doc de
+        // `resolveTimezoneFromProxy`) : seulement si un proxy est utilisé ET que l'appelant n'a
+        // pas déjà choisi `timezoneId` lui-même — jamais question d'écraser un choix explicite.
+        let timezoneId = this.timezoneId;
+        if (proxy && !this.timezoneIdExplicit) {
+          const detected = await resolveTimezoneFromProxy(proxy);
+          if (detected) timezoneId = detected;
+        }
+
         // launchPersistentContext = profil isolé sur disque, comme --user-data-dir
-        context = await launcher.launchPersistentContext(profileDir, {
+        // Cast `BrowserContext` : cf. commentaire sur l'import de `Browser`/`BrowserContext`/`Page`
+        // plus haut — `launcher` peut être soit `chromium` (patchright-core) soit `webkit`
+        // (playwright-core), deux types nominalement distincts pour TypeScript bien
+        // qu'identiques à l'exécution (même protocole CDP/pipe, même shape runtime).
+        context = (await launcher.launchPersistentContext(profileDir, {
           headless: this.headless,
           locale: this.locale,
-          timezoneId: this.timezoneId,
+          timezoneId,
           ...(proxy ? { proxy } : {}),
           ...deviceConfig,
           ...engineArgs,
-        });
+        })) as unknown as BrowserContext;
 
         // Bruit de fingerprint déterministe par profil (canvas/WebGL/audio, cf. doc de
         // `applyFingerprintNoise`) : seedé sur `profileDir`, donc stable pour CE profil (même
@@ -1126,14 +1970,22 @@ export class DriverBuilder {
           await context.addInitScript(applyClientHintsOverride, CLIENT_HINTS_BY_PLATFORM[platformCategory]);
         }
 
-        // Pas de `context.addInitScript(hideWebdriver)` ici pour webkit, volontairement : vérifié
-        // empiriquement sur webkit-2359 (build de repli non officiel pour cette distribution),
-        // supprimer `navigator.webdriver` UNE DEUXIÈME fois (une fois via un script d'init, une
-        // fois via l'évaluation directe de `healthCheck`) corrompt le getter natif — un accès
-        // suivant lève `TypeError: The Navigator.webdriver getter can only be used on instances
-        // of Navigator`, reproductible aussi bien sur un device mobile (iPhone) que desktop
-        // (Desktop Safari). Une seule tentative de suppression, faite dans `healthCheck` juste
-        // avant la lecture, est fiable ; en faire une deuxième ne l'est pas.
+        // `navigator.webdriver` sur WebKit (cf. doc de `hideWebdriverForWebkit`) : Chromium n'en a
+        // pas besoin (`--disable-blink-features=AutomationControlled` protège déjà TOUT document),
+        // WebKit n'a pas d'équivalent — sans ce correctif, seule la page `about:blank` jetable de
+        // `healthCheck` était protégée, pas les vraies pages visitées ensuite (trouvé en testant un
+        // profil 'iPhone 15' réel contre bot-detector.rebrowser.net : `navigator.webdriver = true`
+        // dès la première navigation).
+        if (engine === 'webkit') {
+          await context.addInitScript(hideWebdriverForWebkit);
+        }
+
+        // `navigator.maxTouchPoints` (cf. doc de `patchMaxTouchPoints`) : uniquement pour les
+        // devices à écran tactile (presets mobiles), jamais 'desktop' dont le vrai 0 est correct.
+        // 5 : valeur rapportée par un vrai téléphone (Android comme iOS), sur les deux moteurs.
+        if ((deviceConfig as { hasTouch?: boolean }).hasTouch) {
+          await context.addInitScript(patchMaxTouchPoints, 5);
+        }
 
         // On force le passage par `context.newPage()` plutôt que de réutiliser l'onglet
         // vierge auto-ouvert par certains moteurs (Chromium) sur `launchPersistentContext` :
@@ -1147,36 +1999,52 @@ export class DriverBuilder {
         const page = await context.newPage();
         await Promise.all(staleInitialPages.map((p) => p.close()));
 
+        // cf. doc de `patchHardwareConcurrencyAndWebglVendor` : réimplémente nous-mêmes (sans
+        // Proxy) les évasions `navigator.hardwareConcurrency`/`webgl.vendor`, exclues du plugin
+        // stealth tiers plus haut (`CHROMIUM_STEALTH_EVASIONS`/`GENERIC_STEALTH_EVASIONS`) pour
+        // cette raison. Enregistrée en PREMIER parmi les scripts post-`newPage()` : c'est
+        // maintenant ELLE qui fixe `navigator.hardwareConcurrency` (vu que l'évasion du plugin
+        // stealth ne s'en charge plus), donc `patchWorkerFingerprint` juste en dessous — qui LIT
+        // cette valeur pour la recopier dans chaque worker — doit s'exécuter APRÈS elle. Vérifié
+        // empiriquement : dans l'autre ordre, un worker lisait encore 16 coeurs (la vraie valeur
+        // hôte) au lieu de 4.
+        await context.addInitScript(patchHardwareConcurrencyAndWebglVendor, SPOOFED_HARDWARE_CONCURRENCY);
+
         // Fingerprint des Web Workers (cf. doc de `patchWorkerFingerprint`) : enregistré
-        // seulement MAINTENANT, après `context.newPage()`. Il lit `navigator.hardwareConcurrency`
-        // pour le recopier dans chaque worker, une valeur fixée par une évasion du plugin
-        // stealth qui s'applique au niveau PAGE (via le hook `onPageCreated` de playwright-extra,
-        // déclenché par `newPage()` ci-dessus) plutôt qu'au niveau contexte comme nos propres
-        // scripts. Vérifié empiriquement : enregistré avant `newPage()`, ce script s'exécutait
-        // avant que l'évasion stealth n'ait eu la chance de tourner sur cette page, et lisait
-        // donc encore la vraie valeur de la machine hôte (16 coeurs) plutôt que le 4 attendu.
+        // seulement MAINTENANT, après `context.newPage()` ET après `patchHardwareConcurrencyAndWebglVendor`
+        // ci-dessus (cf. son commentaire). Il lit `navigator.hardwareConcurrency` pour le
+        // recopier dans chaque worker.
         await context.addInitScript(patchWorkerFingerprint);
 
-        // En-tête HTTP Sec-CH-UA (cf. doc de `computeCorrectedSecChUa`) : envoyé par Chromium
+        // cf. doc de `patchWindowOuterDimensions` : remplace l'évasion `window.outerdimensions`
+        // du plugin stealth retiré. S'applique aux deux moteurs, sans dépendance de timing
+        // particulière (simple affectation, pas un correctif qui doit suivre un autre patch).
+        await context.addInitScript(patchWindowOuterDimensions);
+
+        // En-tête HTTP Sec-CH-UA (cf. doc de `applyClientHintsCdpOverride`) : envoyé par Chromium
         // lui-même, "HeadlessChrome" en clair, trouvé en inspectant les en-têtes bruts via
-        // tls.peet.ws — indépendant de tout ce qu'on patche en JS. `context.setExtraHTTPHeaders`
-        // est le seul mécanisme qui survit (route.continue({headers}) échoue, Chromium réinjecte
-        // sa propre valeur après coup, vérifié empiriquement).
+        // tls.peet.ws — indépendant de tout ce qu'on patche en JS. Survit aux redirections HTTP
+        // (contrairement à `setExtraHTTPHeaders`, cf. doc) et n'affecte pas la pile réseau/TLS.
+        // Ré-appliqué sur toute page future du même contexte (popup/nouvel onglet) : une session
+        // CDP n'est pas héritée automatiquement comme le sont les `context.addInitScript`.
         const clientHintsProfile = engine === 'chromium' ? CLIENT_HINTS_BY_PLATFORM[platformCategory] : null;
         if (clientHintsProfile) {
-          const realUa = await page.evaluate(() => navigator.userAgent);
-          await context.setExtraHTTPHeaders({ 'sec-ch-ua': computeCorrectedSecChUa(realUa) });
+          const ctxForClientHints = context;
+          await applyClientHintsCdpOverride(ctxForClientHints, page, clientHintsProfile);
+          ctxForClientHints.on('page', (newPage) => {
+            applyClientHintsCdpOverride(ctxForClientHints, newPage, clientHintsProfile).catch(() => {});
+          });
         }
 
         // Fingerprint des Service Workers (cf. doc de `patchServiceWorkerFingerprint`) :
         // mécanisme distinct des Workers dédiés ci-dessus, inatteignable par une interception du
         // constructeur `Worker` — patché au niveau réseau via `context.route()`.
-        await patchServiceWorkerFingerprint(context, page, clientHintsProfile);
+        await patchServiceWorkerFingerprint(context, page, clientHintsProfile, engine);
 
         // Jitter humain avant la première action
         await this.sleep(400 + Math.random() * 800);
 
-        await this.healthCheck(page);
+        await this.healthCheck(page, engine);
 
         if (this.proxyRotator && proxy) {
           this.proxyRotator.reportSuccess(proxy);
@@ -1224,7 +2092,7 @@ export class DriverBuilder {
     throw new Error(`Impossible de créer un driver sain après ${this.maxRetries} tentatives: ${lastErr}`);
   }
 
-  private async healthCheck(page: Page): Promise<void> {
+  private async healthCheck(page: Page, engine: Engine): Promise<void> {
     await page.goto('about:blank');
     // Une navigation vers `about:blank` ne redéclenche pas de façon fiable les scripts d'init
     // enregistrés au niveau du contexte sur certains moteurs/versions, donc `navigator.webdriver`
@@ -1240,18 +2108,27 @@ export class DriverBuilder {
     // getter via `proto`, seulement via `navigator` (le bon receiver) — pour la LECTURE comme
     // pour le TEST qui décide s'il faut redéfinir la propriété. Une fois redéfinie avec un getter
     // neutre (`() => false`, qui ignore `this`), plus aucun risque de ce côté-là.
+    // `mainWorldEvaluate` (cf. sa doc) plutôt qu'un `page.evaluate` nu : si jamais la branche de
+    // repli ci-dessous devait réellement s'exécuter, une redéfinition posée dans le monde ISOLÉ
+    // (défaut de Patchright côté Chromium) protégerait un `Navigator.prototype` que RIEN d'autre
+    // ne regarde jamais — un vrai script de détection, lui, tourne dans le monde PRINCIPAL. Un
+    // faux sentiment de sécurité serait pire que pas de correctif du tout.
     let isWebdriver: unknown;
     try {
-      isWebdriver = await page.evaluate(() => {
-        if (navigator.webdriver === true) {
-          Object.defineProperty(Object.getPrototypeOf(navigator), 'webdriver', {
-            get: () => false,
-            configurable: true,
-            enumerable: true,
-          });
-        }
-        return navigator.webdriver;
-      });
+      isWebdriver = await mainWorldEvaluate(
+        page,
+        () => {
+          if (navigator.webdriver === true) {
+            Object.defineProperty(Object.getPrototypeOf(navigator), 'webdriver', {
+              get: () => false,
+              configurable: true,
+              enumerable: true,
+            });
+          }
+          return navigator.webdriver;
+        },
+        engine
+      );
     } catch (err) {
       throw new Error(
         `Impossible de vérifier/neutraliser navigator.webdriver — profil non furtif : ${

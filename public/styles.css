@@ -322,6 +322,13 @@ main {
   gap: 8px;
 }
 
+.field-hint {
+  display: block;
+  margin-top: 4px;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+
 .modal-actions {
   display: flex;
   justify-content: flex-end;

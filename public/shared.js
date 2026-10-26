@@ -103,9 +103,16 @@ document.addEventListener('keydown', (e) => {
 // Presets de device curés (parmi la liste complète de playwright.devices côté serveur) : couvre
 // desktop, Android (chromium) et iOS/Safari (webkit, cf. resolveEngineForDevice) pour pouvoir
 // tester les deux moteurs directement depuis le dashboard.
+//
+// 'Desktop Chrome' (preset générique Playwright) volontairement RETIRÉ (2026-10-26) : son UA est
+// figée par Playwright à une version de Chrome qui ne correspond jamais au vrai Chrome installé
+// (`channel: 'chrome'`), ET depuis que 'desktop'/tout preset chromium non-mobile détecte le vrai
+// système hôte (cf. `detectHostPlatformCategory` dans driverBuilder.ts), cette UA figée reste
+// "Windows" alors que `navigator.platform`/Client Hints suivent maintenant le vrai host — testé
+// contre bot-detector.rebrowser.net : `platformMismatch` rouge (UA Windows vs platform Linux).
+// 'desktop' fait tout ce que 'Desktop Chrome' faisait, en mieux (UA dynamique, cohérente).
 const DEVICE_PRESETS = [
   'desktop',
-  'Desktop Chrome',
   'Desktop Safari',
   'Pixel 7',
   'Pixel 7 Pro',
@@ -113,6 +120,32 @@ const DEVICE_PRESETS = [
   'iPhone 15 Pro Max',
   'iPad Mini',
 ];
+
+// Seul 'desktop' varie selon la machine qui fait tourner le serveur (cf.
+// `detectHostPlatformCategory` dans driverBuilder.ts) : les autres presets (iPhone 15, Pixel 7...)
+// sont des émulations figées, déjà explicites dans leur nom — pas besoin de les interroger.
+// Récupéré une seule fois au chargement de la page : le système hôte ne change pas en cours de
+// session. Partagé entre app.js (nouveau profil) et profile.js (édition d'un profil existant).
+const DESKTOP_PLATFORM_LABELS = { windows: 'Windows', macos: 'macOS', linux: 'Linux' };
+let desktopPlatformLabel = null;
+const desktopPlatformReady = api('/api/host-info')
+  .then((info) => {
+    desktopPlatformLabel = DESKTOP_PLATFORM_LABELS[info.desktopPlatform] || info.desktopPlatform;
+  })
+  .catch(() => {
+    // Best-effort : l'indicateur est un confort, jamais bloquant pour créer/éditer un profil.
+  });
+
+/** Met à jour le petit texte sous le sélecteur de device avec le système que 'desktop' va claim. */
+function updateDevicePlatformHint(device, hintElementId) {
+  const hint = document.getElementById(hintElementId);
+  if (!hint) return;
+  hint.textContent = device === 'desktop' && desktopPlatformLabel ? `→ ce profil va claim : ${desktopPlatformLabel} (système hôte détecté)` : '';
+  if (device === 'desktop' && !desktopPlatformLabel) {
+    // Pas encore chargé (requête réseau en cours) : se remettre à jour dès que prêt.
+    desktopPlatformReady.then(() => updateDevicePlatformHint(device, hintElementId));
+  }
+}
 
 // Locales courantes (format BCP 47 exact attendu par Playwright) — pas de liste standard côté
 // navigateur pour ça (contrairement aux fuseaux horaires, cf. TIMEZONE_OPTIONS), donc on en

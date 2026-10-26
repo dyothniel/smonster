@@ -2,6 +2,7 @@ import express from 'express';
 import type { NextFunction, Request, Response } from 'express';
 import * as path from 'path';
 import { ProfileManager, ProfileNotFoundError } from '../profileManager';
+import { detectHostPlatformCategory } from '../driverBuilder';
 import { createProfilesRouter } from './profilesRouter';
 
 export interface CreateAppOptions {
@@ -19,6 +20,15 @@ export function createApp(manager: ProfileManager, opts: CreateAppOptions = {}) 
 
   const publicDir = opts.publicDir ?? path.join(__dirname, '..', '..', 'public');
   app.use(express.static(publicDir));
+
+  // Expose au dashboard le système que le device 'desktop' va réellement claim sur CETTE machine
+  // (cf. `detectHostPlatformCategory` dans driverBuilder.ts) : auparavant, rien dans l'UI
+  // n'indiquait quel OS un profil "desktop" allait prétendre être — invisible pour la personne qui
+  // crée le profil. Les autres presets (iPhone 15, Pixel 7...) n'ont pas besoin de cet endpoint :
+  // leur plateforme est déjà évidente dans leur nom, ce sont des émulations figées, pas détectées.
+  app.get('/api/host-info', (_req: Request, res: Response) => {
+    res.json({ desktopPlatform: detectHostPlatformCategory() });
+  });
 
   app.use('/api/profiles', createProfilesRouter(manager));
 

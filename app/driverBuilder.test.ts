@@ -4,9 +4,20 @@ import * as fs from 'fs';
 import * as http from 'http';
 import * as os from 'os';
 import * as path from 'path';
-import { webkit } from 'playwright-extra';
-import type { Page } from 'playwright';
-import { DriverBuilder, resolveEngineForDevice, hashToSeed } from './driverBuilder';
+import { webkit } from 'playwright';
+import type { Page } from 'patchright';
+import {
+  DriverBuilder,
+  resolveEngineForDevice,
+  hashToSeed,
+  mainWorldEvaluate,
+  detectHostPlatformCategory,
+} from './driverBuilder';
+
+// Le device 'desktop' claim maintenant le VRAI système hôte (cf. doc de `detectHostPlatformCategory`
+// dans driverBuilder.ts, et §4 de README.md) plutôt que "Windows" en dur — ces tests tournent donc
+// potentiellement sur n'importe lequel des trois hosts détectables, jamais un seul supposé fixe.
+const HOST_PLATFORM = detectHostPlatformCategory();
 import { ProxyRotator } from './proxyRotator';
 
 // --- resolveEngineForDevice : routing pur, sans navigateur -----------------------------
@@ -58,7 +69,7 @@ test('build(): device inconnu échoue vite, sans jamais tenter de lancer un navi
   await assert.rejects(() => builder.build(), /Device inconnu/);
 });
 
-test('build(): device "desktop" headless a un UA propre (pas de HeadlessChrome/Linux)', async () => {
+test('build(): device "desktop" headless a un UA propre (pas de HeadlessChrome), cohérent avec le host détecté', async () => {
   const builder = new DriverBuilder({
     baseProfileDir: makeTempProfileRoot(),
     headless: true,
@@ -66,12 +77,24 @@ test('build(): device "desktop" headless a un UA propre (pas de HeadlessChrome/L
   });
   const { context, page } = await builder.build();
   try {
-    const ua = await page.evaluate(() => navigator.userAgent);
+    const ua = await mainWorldEvaluate(page, () => navigator.userAgent, 'chromium');
     assert.doesNotMatch(ua, /Headless/);
-    assert.doesNotMatch(ua, /Linux/);
     assert.match(ua, /Chrome\//);
+    // L'UA doit correspondre au système RÉELLEMENT détecté (cf. `detectHostPlatformCategory`),
+    // jamais aux deux autres — une incohérence ici serait exactement le genre de fuite
+    // (`platformMismatch`) qu'on a corrigée.
+    if (HOST_PLATFORM === 'linux') {
+      assert.match(ua, /Linux/);
+      assert.doesNotMatch(ua, /Windows|Macintosh/);
+    } else if (HOST_PLATFORM === 'windows') {
+      assert.match(ua, /Windows/);
+      assert.doesNotMatch(ua, /Linux|Macintosh/);
+    } else {
+      assert.match(ua, /Macintosh/);
+      assert.doesNotMatch(ua, /Linux|Windows/);
+    }
 
-    const isWebdriver = await page.evaluate(() => navigator.webdriver);
+    const isWebdriver = await mainWorldEvaluate(page, () => navigator.webdriver, 'chromium');
     assert.equal(isWebdriver, false);
   } finally {
     await DriverBuilder.quit(context);
@@ -87,7 +110,7 @@ test('build(): device Android garde son UA (non écrasé par un UA desktop)', as
   });
   const { context, page } = await builder.build();
   try {
-    const ua = await page.evaluate(() => navigator.userAgent);
+    const ua = await mainWorldEvaluate(page, () => navigator.userAgent, 'chromium');
     assert.match(ua, /Android/);
     assert.match(ua, /Pixel 7/);
     assert.doesNotMatch(ua, /Windows/);
@@ -96,9 +119,10 @@ test('build(): device Android garde son UA (non écrasé par un UA desktop)', as
   }
 });
 
-test('build(): les évasions stealth au niveau page (webgl.vendor) s\'appliquent bien sur la page retournée', async () => {
-  // Régression : l'onglet auto-ouvert par launchPersistentContext ne passe pas par le hook
-  // onPageCreated de playwright-extra, donc les évasions stealth n'y étaient pas appliquées.
+test('build(): le masquage webgl.vendor (patchHardwareConcurrencyAndWebglVendor) s\'applique bien sur la page retournée', async () => {
+  // Régression : l'onglet auto-ouvert par launchPersistentContext ne passe pas par
+  // `context.newPage()`, donc les `addInitScript` enregistrés APRÈS (cf. `build()`) n'y
+  // tournent pas.
   const builder = new DriverBuilder({
     baseProfileDir: makeTempProfileRoot(),
     headless: true,
@@ -106,12 +130,15 @@ test('build(): les évasions stealth au niveau page (webgl.vendor) s\'appliquent
   });
   const { context, page } = await builder.build();
   try {
-    const vendor = await page.evaluate(() => {
+    // `mainWorldEvaluate` : le canvas/WebGL créés ici doivent utiliser les prototypes du monde
+    // PRINCIPAL (où `patchHardwareConcurrencyAndWebglVendor` a patché `getParameter`), pas ceux
+    // du monde isolé où `page.evaluate` tourne par défaut sous Patchright.
+    const vendor = await mainWorldEvaluate(page, () => {
       const canvas = document.createElement('canvas');
       const gl = canvas.getContext('webgl') as WebGLRenderingContext | null;
       const dbg = gl?.getExtension('WEBGL_debug_renderer_info');
       return dbg ? gl!.getParameter(dbg.UNMASKED_VENDOR_WEBGL) : null;
-    });
+    }, 'chromium');
     assert.notEqual(vendor, 'Google Inc. (Google)');
   } finally {
     await DriverBuilder.quit(context);
@@ -134,17 +161,17 @@ test(
     });
     const { context, page } = await builder.build();
     try {
-      const ua = await page.evaluate(() => navigator.userAgent);
+      const ua = await mainWorldEvaluate(page, () => navigator.userAgent, 'webkit');
       assert.match(ua, /iPhone/);
       assert.match(ua, /Safari/);
       assert.doesNotMatch(ua, /Chrome/);
 
-      const isWebdriver = await page.evaluate(() => navigator.webdriver);
+      const isWebdriver = await mainWorldEvaluate(page, () => navigator.webdriver, 'webkit');
       assert.ok(isWebdriver === false || isWebdriver === undefined);
 
       // Un vrai Safari n'a jamais `window.chrome` : si ça apparaît, une évasion Chromium a
-      // fuité vers le stealth WebKit (cf. GENERIC_STEALTH_EVASIONS dans driverBuilder.ts).
-      const hasChromeGlobal = await page.evaluate(() => 'chrome' in window);
+      // fuité vers WebKit.
+      const hasChromeGlobal = await mainWorldEvaluate(page, () => 'chrome' in window, 'webkit');
       assert.equal(hasChromeGlobal, false);
     } finally {
       await DriverBuilder.quit(context);
@@ -192,6 +219,48 @@ test('build(): expose sur BuiltDriver le proxy statique effectivement utilisé',
     assert.equal(usedProxy, proxy);
   } finally {
     await DriverBuilder.quit(context);
+  }
+});
+
+// Découvert en testant un profil proxifié contre pixelscan.net/fingerprint-check : signalé
+// "Timezone spoofed"/"Masking detected" parce que `timezoneId` vaut toujours 'Europe/Paris' par
+// défaut, sans AUCUN rapport avec le pays de sortie réel du proxy — cf. doc de
+// `resolveTimezoneFromProxy` dans driverBuilder.ts pour la détection auto (best-effort, via
+// ip-api.com) censée corriger ça. Ces deux tests ne dépendent PAS d'un accès réseau réel à
+// ip-api.com (injoignable depuis certains environnements sandboxés, constaté empiriquement) :
+// ils vérifient seulement que l'échec de la détection ne casse jamais `build()` (repli sur la
+// valeur par défaut), et qu'un `timezoneId` fourni explicitement n'est JAMAIS écrasé.
+
+test('build() + proxy: un `timezoneId` explicite n\'est jamais écrasé par la détection auto', async () => {
+  const builder = new DriverBuilder({
+    baseProfileDir: makeTempProfileRoot(),
+    headless: true,
+    proxy: { server: 'http://127.0.0.1:1' }, // injoignable — la détection ne doit même pas être tentée
+    timezoneId: 'Asia/Tokyo',
+    maxRetries: 1,
+  });
+  const driver = await builder.build();
+  try {
+    const tz = await mainWorldEvaluate(driver.page, () => Intl.DateTimeFormat().resolvedOptions().timeZone, 'chromium');
+    assert.equal(tz, 'Asia/Tokyo');
+  } finally {
+    await DriverBuilder.quit(driver.context);
+  }
+});
+
+test('build() + proxy sans `timezoneId` explicite: une détection auto impossible retombe sur le défaut sans faire échouer build()', async () => {
+  const builder = new DriverBuilder({
+    baseProfileDir: makeTempProfileRoot(),
+    headless: true,
+    proxy: { server: 'http://127.0.0.1:1' }, // injoignable — la détection doit échouer silencieusement
+    maxRetries: 1,
+  });
+  const driver = await builder.build();
+  try {
+    const tz = await mainWorldEvaluate(driver.page, () => Intl.DateTimeFormat().resolvedOptions().timeZone, 'chromium');
+    assert.equal(tz, 'Europe/Paris');
+  } finally {
+    await DriverBuilder.quit(driver.context);
   }
 });
 
@@ -284,7 +353,7 @@ test('hashToSeed(): déterministe, et des chaînes différentes donnent des seed
 });
 
 async function readCanvasFingerprint(page: Page): Promise<string> {
-  return page.evaluate(() => {
+  return mainWorldEvaluate(page, () => {
     const canvas = document.createElement('canvas');
     canvas.width = 220;
     canvas.height = 30;
@@ -296,7 +365,7 @@ async function readCanvasFingerprint(page: Page): Promise<string> {
     ctx.fillStyle = '#069';
     ctx.fillText('Canvas fingerprint test', 2, 15);
     return canvas.toDataURL();
-  });
+  }, 'chromium');
 }
 
 test('bruit canvas: deux profils différents (même device/proxy/timezone) ont un fingerprint canvas différent', async () => {
@@ -332,7 +401,7 @@ test("bruit canvas: getImageData reste cohérent entre deux appels dans la même
   const builder = new DriverBuilder({ baseProfileDir: makeTempProfileRoot(), headless: true, maxRetries: 1 });
   const driver = await builder.build();
   try {
-    const [a, b] = await driver.page.evaluate(() => {
+    const [a, b] = await mainWorldEvaluate(driver.page, () => {
       const canvas = document.createElement('canvas');
       canvas.width = 50;
       canvas.height = 50;
@@ -342,7 +411,7 @@ test("bruit canvas: getImageData reste cohérent entre deux appels dans la même
       const d1 = Array.from(ctx.getImageData(0, 0, 50, 50).data);
       const d2 = Array.from(ctx.getImageData(0, 0, 50, 50).data);
       return [d1, d2];
-    });
+    }, 'chromium');
     assert.deepEqual(a, b, 'deux lectures du même canvas dans la même session doivent être identiques');
   } finally {
     await DriverBuilder.quit(driver.context);
@@ -352,7 +421,7 @@ test("bruit canvas: getImageData reste cohérent entre deux appels dans la même
 // --- Bruit WebGL (readPixels) déterministe par profil ------------------------------------
 
 async function readWebglFingerprint(page: Page): Promise<number[]> {
-  return page.evaluate(() => {
+  return mainWorldEvaluate(page, () => {
     const canvas = document.createElement('canvas');
     canvas.width = 32;
     canvas.height = 32;
@@ -362,7 +431,7 @@ async function readWebglFingerprint(page: Page): Promise<number[]> {
     const pixels = new Uint8Array(32 * 32 * 4);
     gl.readPixels(0, 0, 32, 32, gl.RGBA, gl.UNSIGNED_BYTE, pixels);
     return Array.from(pixels);
-  });
+  }, 'chromium');
 }
 
 test('bruit WebGL: deux profils différents ont un readPixels différent', async () => {
@@ -397,7 +466,7 @@ test('bruit WebGL: un même profil (chemin fixe) garde le même readPixels à ch
 // --- Bruit audio (AudioBuffer.getChannelData) déterministe par profil --------------------
 
 async function readAudioFingerprint(page: Page): Promise<number[]> {
-  return page.evaluate(async () => {
+  return mainWorldEvaluate(page, async () => {
     const ctx = new OfflineAudioContext(1, 5000, 44100);
     const oscillator = ctx.createOscillator();
     oscillator.type = 'triangle';
@@ -408,7 +477,7 @@ async function readAudioFingerprint(page: Page): Promise<number[]> {
     oscillator.start(0);
     const buffer = await ctx.startRendering();
     return Array.from(buffer.getChannelData(0).slice(0, 200));
-  });
+  }, 'chromium');
 }
 
 test('bruit audio: deux profils différents ont un fingerprint audio différent', async () => {
@@ -448,7 +517,7 @@ test('bruit audio: un même profil (chemin fixe) garde le même fingerprint audi
  * confirmant qu'un Chromium non patché produit bien un candidat `typ host` dans cet environnement).
  */
 async function collectIceCandidates(page: Page): Promise<string[]> {
-  return page.evaluate(() => {
+  return mainWorldEvaluate(page, () => {
     return new Promise<string[]>((resolve) => {
       const pc = new RTCPeerConnection();
       const candidates: string[] = [];
@@ -463,7 +532,7 @@ async function collectIceCandidates(page: Page): Promise<string[]> {
       pc.createOffer().then((offer) => pc.setLocalDescription(offer));
       setTimeout(() => resolve(candidates), 4000); // filet de sécurité si l'event de fin n'arrive jamais
     });
-  });
+  }, 'chromium');
 }
 
 test("anti-fuite WebRTC: aucun candidat ICE host/srflx/prflx ne fuite via onicecandidate", async () => {
@@ -484,11 +553,11 @@ test('anti-fuite WebRTC: RTCPeerConnection reste présent et fonctionnel (pas ju
   const builder = new DriverBuilder({ baseProfileDir: makeTempProfileRoot(), headless: true, maxRetries: 1 });
   const driver = await builder.build();
   try {
-    const info = await driver.page.evaluate(() => {
+    const info = await mainWorldEvaluate(driver.page, () => {
       const pc = new RTCPeerConnection();
       const channel = pc.createDataChannel('test');
       return { hasRTC: typeof RTCPeerConnection === 'function', channelLabel: channel.label };
-    });
+    }, 'chromium');
     assert.equal(info.hasRTC, true);
     assert.equal(info.channelLabel, 'test');
   } finally {
@@ -498,32 +567,57 @@ test('anti-fuite WebRTC: RTCPeerConnection reste présent et fonctionnel (pas ju
 
 // --- Défense fingerprint de polices --------------------------------------------------------
 
-async function measureFont(page: Page, font: string): Promise<number> {
-  return page.evaluate((f) => {
+async function measureFont(page: Page, font: string, engine: 'chromium' | 'webkit'): Promise<number> {
+  // `measureFont` prend un argument (`font`), donc n'utilise pas `mainWorldEvaluate` (réservé aux
+  // fonctions sans argument), mais a besoin du même traitement — `applyFontFingerprintDefense`
+  // patche le monde PRINCIPAL, pas le monde isolé où tourne `page.evaluate` par défaut côté
+  // Chromium sous Patchright. `engine` : le 3e argument positionnel `isolatedContext` fait
+  // PLANTER `webkit` (resté sur `playwright` classique, cf. doc de `mainWorldEvaluate`), donc
+  // branche séparée pour ce moteur.
+  const fn = (f: string) => {
     const canvas = document.createElement('canvas');
     const ctx = canvas.getContext('2d')!;
     ctx.font = `72px ${f}, monospace`;
     return ctx.measureText('mmmmmmmmmmlli').width;
-  }, font);
+  };
+  if (engine === 'webkit') {
+    return page.evaluate(fn, font);
+  }
+  return page.evaluate(fn, font, undefined, false);
 }
 
-test("fingerprint de polices: sur un profil desktop (Windows), Arial semble installée mais pas une police Linux (DejaVu Sans)", async () => {
+test("fingerprint de polices: sur un profil desktop, une police du système réellement détecté semble installée, pas une police d'un AUTRE système", async () => {
+  // 'desktop' claim maintenant le vrai host (cf. `detectHostPlatformCategory`), donc la paire
+  // "police attendue présente / police attendue absente" dépend de la machine qui fait tourner
+  // ce test — jamais "Windows" supposé fixe. `Arial` n'est volontairement PAS utilisée comme
+  // police "absente sur Linux" : cette distribution l'alias déjà métriquement vers Liberation
+  // Sans (cf. `scripts/setup-fonts.sh`), donc elle semblerait installée sur les deux systèmes et
+  // ne distinguerait rien.
+  const [presentFont, absentFont] =
+    HOST_PLATFORM === 'windows'
+      ? ['Arial', 'DejaVu Sans']
+      : HOST_PLATFORM === 'macos'
+        ? ['Helvetica Neue', 'Segoe UI']
+        : ['DejaVu Sans', 'Segoe UI'];
+
   const builder = new DriverBuilder({ baseProfileDir: makeTempProfileRoot(), headless: true, maxRetries: 1 });
   const driver = await builder.build();
   try {
-    const baseline = await measureFont(driver.page, '__nonexistent_probe_font__');
-    const arial = await measureFont(driver.page, 'Arial');
-    const dejavu = await measureFont(driver.page, 'DejaVu Sans');
-    const liberation = await measureFont(driver.page, 'Liberation Sans');
+    const baseline = await measureFont(driver.page, '__nonexistent_probe_font__', 'chromium');
+    const present = await measureFont(driver.page, presentFont, 'chromium');
+    const absent = await measureFont(driver.page, absentFont, 'chromium');
 
-    assert.notEqual(arial, baseline, 'Arial doit sembler installée sur un profil Windows');
-    assert.equal(dejavu, baseline, "DejaVu Sans (police Linux) ne doit pas sembler installée sur Windows");
-    assert.equal(liberation, baseline, "Liberation Sans (police Linux) ne doit pas sembler installée sur Windows");
+    assert.notEqual(present, baseline, `${presentFont} doit sembler installée sur un profil ${HOST_PLATFORM}`);
+    assert.equal(absent, baseline, `${absentFont} ne doit pas sembler installée sur un profil ${HOST_PLATFORM}`);
 
-    const fontsCheckArial = await driver.page.evaluate(() => document.fonts.check('72px Arial'));
-    const fontsCheckDejaVu = await driver.page.evaluate(() => document.fonts.check('72px DejaVu Sans'));
-    assert.equal(fontsCheckArial, true);
-    assert.equal(fontsCheckDejaVu, false);
+    // Pas `mainWorldEvaluate` ici : son 4e argument positionnel (`isolatedContext: false`) laisse
+    // la place à un 2e argument (`arg`), nécessaire pour passer `presentFont`/`absentFont` SANS
+    // fermeture — une closure Node sur ces variables ne survivrait pas à la sérialisation de la
+    // fonction vers la page (cf. doc de `measureFont`, même contrainte).
+    const fontsCheckPresent = await driver.page.evaluate((f) => document.fonts.check(`72px ${f}`), presentFont, undefined, false);
+    const fontsCheckAbsent = await driver.page.evaluate((f) => document.fonts.check(`72px ${f}`), absentFont, undefined, false);
+    assert.equal(fontsCheckPresent, true);
+    assert.equal(fontsCheckAbsent, false);
   } finally {
     await DriverBuilder.quit(driver.context);
   }
@@ -538,9 +632,9 @@ test('fingerprint de polices: sur un profil Android, Roboto semble installée ma
   });
   const driver = await builder.build();
   try {
-    const baseline = await measureFont(driver.page, '__nonexistent_probe_font__');
-    const roboto = await measureFont(driver.page, 'Roboto');
-    const segoeUi = await measureFont(driver.page, 'Segoe UI');
+    const baseline = await measureFont(driver.page, '__nonexistent_probe_font__', 'chromium');
+    const roboto = await measureFont(driver.page, 'Roboto', 'chromium');
+    const segoeUi = await measureFont(driver.page, 'Segoe UI', 'chromium');
 
     assert.notEqual(roboto, baseline, 'Roboto doit sembler installée sur un profil Android');
     assert.equal(segoeUi, baseline, "Segoe UI (police Windows) ne doit pas sembler installée sur Android");
@@ -561,10 +655,10 @@ test(
     });
     const driver = await builder.build();
     try {
-      const baseline = await measureFont(driver.page, '__nonexistent_probe_font__');
-      const helveticaNeue = await measureFont(driver.page, 'Helvetica Neue');
-      const menlo = await measureFont(driver.page, 'Menlo');
-      const roboto = await measureFont(driver.page, 'Roboto');
+      const baseline = await measureFont(driver.page, '__nonexistent_probe_font__', 'webkit');
+      const helveticaNeue = await measureFont(driver.page, 'Helvetica Neue', 'webkit');
+      const menlo = await measureFont(driver.page, 'Menlo', 'webkit');
+      const roboto = await measureFont(driver.page, 'Roboto', 'webkit');
 
       assert.notEqual(
         helveticaNeue,
@@ -585,7 +679,16 @@ test(
 // ["en-US","en"] même avec `locale: 'fr-FR'` (valeur figée par le plugin stealth, indépendante
 // de la vraie locale — cf. doc de `applyNavigatorOverrides` dans driverBuilder.ts).
 
-test('navigator.platform/languages: profil desktop (Windows) — cohérents avec la vraie locale configurée', async () => {
+// `navigator.platform` attendu par système host détectable (cf. `PLATFORM_STRINGS` dans
+// driverBuilder.ts, non exporté — valeurs dupliquées ici intentionnellement, ce sont des chaînes
+// stables du web platform, pas un détail d'implémentation interne).
+const EXPECTED_PLATFORM_STRING: Record<'windows' | 'macos' | 'linux', string> = {
+  windows: 'Win32',
+  macos: 'MacIntel',
+  linux: 'Linux x86_64',
+};
+
+test('navigator.platform/languages: profil desktop — cohérents avec le vrai host détecté et la locale configurée', async () => {
   const builder = new DriverBuilder({
     baseProfileDir: makeTempProfileRoot(),
     headless: true,
@@ -594,12 +697,16 @@ test('navigator.platform/languages: profil desktop (Windows) — cohérents avec
   });
   const driver = await builder.build();
   try {
-    const info = await driver.page.evaluate(() => ({
-      platform: navigator.platform,
-      language: navigator.language,
-      languages: navigator.languages,
-    }));
-    assert.equal(info.platform, 'Win32');
+    const info = await mainWorldEvaluate(
+      driver.page,
+      () => ({
+        platform: navigator.platform,
+        language: navigator.language,
+        languages: navigator.languages,
+      }),
+      'chromium'
+    );
+    assert.equal(info.platform, EXPECTED_PLATFORM_STRING[HOST_PLATFORM]);
     assert.equal(info.language, 'de-DE');
     assert.deepEqual(info.languages, ['de-DE', 'de']);
   } finally {
@@ -616,7 +723,7 @@ test('navigator.platform: profil Android — "Linux armv8l", pas la vraie platef
   });
   const driver = await builder.build();
   try {
-    const platform = await driver.page.evaluate(() => navigator.platform);
+    const platform = await mainWorldEvaluate(driver.page, () => navigator.platform, 'chromium');
     assert.equal(platform, 'Linux armv8l');
   } finally {
     await DriverBuilder.quit(driver.context);
@@ -627,20 +734,28 @@ test('navigator.platform: profil Android — "Linux armv8l", pas la vraie platef
 // `getHighEntropyValues()` révélait littéralement la marque "HeadlessChrome" (constaté via
 // CreepJS) — nécessite un contexte sécurisé (HTTPS), d'où la navigation vers une vraie page.
 
+// `userAgentData.platform` attendu par système host détectable (cf. `CLIENT_HINTS_BY_PLATFORM`
+// dans driverBuilder.ts — valeurs Client Hints standard, pas un détail d'implémentation interne).
+const EXPECTED_UA_DATA_PLATFORM: Record<'windows' | 'macos' | 'linux', string> = {
+  windows: 'Windows',
+  macos: 'macOS',
+  linux: 'Linux',
+};
+
 test('Client Hints: ne révèlent pas "Headless", cohérents avec la plateforme et la version de navigator.userAgent', async () => {
   const builder = new DriverBuilder({ baseProfileDir: makeTempProfileRoot(), headless: true, maxRetries: 1 });
   const driver = await builder.build();
   try {
     await driver.page.goto('https://example.com', { waitUntil: 'domcontentloaded', timeout: 20000 });
-    const info = await driver.page.evaluate(async () => {
+    const info = await mainWorldEvaluate(driver.page, async () => {
       if (!('userAgentData' in navigator)) return null;
       const hev = await (navigator as any).userAgentData.getHighEntropyValues(['platform', 'uaFullVersion']);
       return { brands: (navigator as any).userAgentData.brands, platform: (navigator as any).userAgentData.platform, hev };
-    });
+    }, 'chromium');
     assert.ok(info, 'navigator.userAgentData doit exister sur un contexte sécurisé (Chromium)');
     const brandNames = info!.brands.map((b: { brand: string }) => b.brand).join(',');
     assert.doesNotMatch(brandNames, /Headless/i);
-    assert.equal(info!.platform, 'Windows');
+    assert.equal(info!.platform, EXPECTED_UA_DATA_PLATFORM[HOST_PLATFORM]);
     assert.doesNotMatch(info!.hev.uaFullVersion, /Headless/i);
   } finally {
     await DriverBuilder.quit(driver.context);
@@ -656,7 +771,7 @@ test('fingerprint des Workers: un worker construit depuis un blob: reflète les 
   const builder = new DriverBuilder({ baseProfileDir: makeTempProfileRoot(), headless: true, maxRetries: 1 });
   const driver = await builder.build();
   try {
-    const [main, worker] = await driver.page.evaluate(() => {
+    const [main, worker] = await mainWorldEvaluate(driver.page, () => {
       const mainInfo = {
         ua: navigator.userAgent,
         platform: navigator.platform,
@@ -673,7 +788,7 @@ test('fingerprint des Workers: un worker construit depuis un blob: reflète les 
         setTimeout(() => resolve({ timeout: true }), 5000);
       });
       return Promise.all([mainInfo, workerInfo]);
-    });
+    }, 'chromium');
     assert.deepEqual(worker, main, 'le worker doit voir exactement les mêmes valeurs (déjà spoofées) que le thread principal');
     assert.doesNotMatch((worker as any).ua, /Headless/i);
   } finally {
@@ -727,7 +842,7 @@ test('fingerprint des Service Workers: reflète les valeurs déjà spoofées du 
   const driver = await builder.build();
   try {
     await driver.page.goto(`${swOrigin}/`, { waitUntil: 'domcontentloaded', timeout: 20000 });
-    await driver.page.evaluate(async () => {
+    await mainWorldEvaluate(driver.page, async () => {
       await navigator.serviceWorker.register('/sw.js');
       await navigator.serviceWorker.ready;
       if (!navigator.serviceWorker.controller) {
@@ -736,27 +851,27 @@ test('fingerprint des Service Workers: reflète les valeurs déjà spoofées du 
           setTimeout(resolve, 5000);
         });
       }
-    });
+    }, 'chromium');
 
-    const hasController = await driver.page.evaluate(() => !!navigator.serviceWorker.controller);
+    const hasController = await mainWorldEvaluate(driver.page, () => !!navigator.serviceWorker.controller, 'chromium');
     assert.ok(hasController, 'le Service Worker doit avoir pris le contrôle de la page (clients.claim())');
 
-    const main = await driver.page.evaluate(async () => {
+    const main = await mainWorldEvaluate(driver.page, async () => {
       let userAgentData = null;
       if ('userAgentData' in navigator) {
         const hev = await (navigator as any).userAgentData.getHighEntropyValues(['platform', 'uaFullVersion']);
         userAgentData = { brands: (navigator as any).userAgentData.brands, platform: (navigator as any).userAgentData.platform, hev };
       }
       return { ua: navigator.userAgent, platform: navigator.platform, cores: navigator.hardwareConcurrency, userAgentData };
-    });
-    const sw = await driver.page.evaluate(() => {
+    }, 'chromium');
+    const sw = await mainWorldEvaluate(driver.page, () => {
       return new Promise((resolve) => {
         const channel = new MessageChannel();
         channel.port1.onmessage = (e) => resolve(e.data);
         navigator.serviceWorker.controller!.postMessage({ cmd: 'fingerprint' }, [channel.port2]);
         setTimeout(() => resolve({ timeout: true }), 5000);
       });
-    });
+    }, 'chromium');
 
     assert.deepEqual(sw, main, 'le Service Worker doit voir exactement les mêmes valeurs (déjà spoofées) que le thread principal');
     assert.doesNotMatch((sw as any).ua, /Headless/i);
@@ -770,13 +885,82 @@ test('fingerprint des Service Workers: reflète les valeurs déjà spoofées du 
   }
 });
 
+// Régression (2026-10-26) : une page YouTube réelle restait blanche (vidéo/audio natifs jouaient,
+// mais aucune UI ne s'affichait) à cause de `patchServiceWorkerFingerprint` qui préfixait du JS
+// devant TOUTE ressource récupérée par le Service Worker, pas seulement son propre script — un
+// Service Worker de production (précaching type Workbox) fait aussi des `fetch()` internes pour du
+// CSS/JSON/images, que `request.serviceWorker()` non-null ne distingue pas de son script JS. Ce
+// test verrouille que seule une réponse réellement JavaScript (Content-Type) est réécrite ; une
+// ressource non-JS récupérée PAR le Service Worker doit ressortir strictement inchangée.
+test('fingerprint des Service Workers: une ressource NON-JS récupérée par le Service Worker (ex. JSON de précaching) n\'est jamais réécrite', async () => {
+  const JSON_BODY = JSON.stringify({ hello: 'world', cached: true });
+  const swServer = http.createServer((req, res) => {
+    if (req.url === '/sw.js') {
+      res.writeHead(200, { 'Content-Type': 'application/javascript' });
+      res.end(`
+        self.addEventListener('install', () => self.skipWaiting());
+        self.addEventListener('activate', (e) => e.waitUntil(self.clients.claim()));
+        self.addEventListener('message', async (e) => {
+          const r = await fetch('/data.json');
+          const text = await r.text();
+          e.ports[0].postMessage({ text });
+        });
+      `);
+    } else if (req.url === '/data.json') {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON_BODY);
+    } else {
+      res.writeHead(200, { 'Content-Type': 'text/html' });
+      res.end('<!doctype html><html><body>ok</body></html>');
+    }
+  });
+  await new Promise<void>((resolve) => swServer.listen(0, '127.0.0.1', () => resolve()));
+  const address = swServer.address();
+  if (address === null || typeof address === 'string') throw new Error('adresse de serveur HTTP inattendue');
+  const swOrigin = `http://127.0.0.1:${address.port}`;
+
+  const builder = new DriverBuilder({ baseProfileDir: makeTempProfileRoot(), headless: true, maxRetries: 1 });
+  const driver = await builder.build();
+  try {
+    await driver.page.goto(`${swOrigin}/`, { waitUntil: 'domcontentloaded', timeout: 20000 });
+    await mainWorldEvaluate(driver.page, async () => {
+      await navigator.serviceWorker.register('/sw.js');
+      await navigator.serviceWorker.ready;
+      if (!navigator.serviceWorker.controller) {
+        await new Promise<void>((resolve) => {
+          navigator.serviceWorker.addEventListener('controllerchange', () => resolve(), { once: true });
+          setTimeout(resolve, 5000);
+        });
+      }
+    }, 'chromium');
+
+    const result = await mainWorldEvaluate(driver.page, () => {
+      return new Promise((resolve) => {
+        const channel = new MessageChannel();
+        channel.port1.onmessage = (e) => resolve(e.data);
+        navigator.serviceWorker.controller!.postMessage({ cmd: 'fetch-json' }, [channel.port2]);
+        setTimeout(() => resolve({ timeout: true }), 5000);
+      });
+    }, 'chromium');
+
+    assert.equal(
+      (result as any).text,
+      JSON_BODY,
+      'une ressource JSON récupérée par le Service Worker doit ressortir identique, jamais préfixée de JS'
+    );
+  } finally {
+    await DriverBuilder.quit(driver.context);
+    await new Promise<void>((resolve) => swServer.close(() => resolve()));
+  }
+});
+
 // --- En-tête HTTP Sec-CH-UA ----------------------------------------------------------------
 // Découvert en inspectant les en-têtes bruts réellement envoyés sur le réseau (via tls.peet.ws) :
 // Chromium calcule lui-même cet en-tête à partir du binaire réellement exécuté (le build
 // headless) et y met "HeadlessChrome" en clair, sur CHAQUE requête, dès la toute première —
 // totalement invisible à un test purement côté page (CreepJS y compris) puisque c'est un en-tête
 // SORTANT, jamais un test JS ne peut lire ses propres en-têtes de requête. cf. doc de
-// `computeCorrectedSecChUa`/`patchServiceWorkerFingerprint` dans driverBuilder.ts.
+// `applyClientHintsCdpOverride`/`patchServiceWorkerFingerprint` dans driverBuilder.ts.
 
 test('en-tête HTTP Sec-CH-UA: ne révèle pas "Headless", même sur la toute première requête', async () => {
   let capturedHeaders: http.IncomingHttpHeaders | null = null;
@@ -801,5 +985,86 @@ test('en-tête HTTP Sec-CH-UA: ne révèle pas "Headless", même sur la toute pr
   } finally {
     await DriverBuilder.quit(driver.context);
     await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
+
+// Découvert en testant une vraie tentative de connexion sur x.com : ce site redirige (302) sa
+// page de login vers un endpoint de vérification anti-bot avant d'afficher le formulaire — et
+// CET endpoint, atteint uniquement via la redirection, recevait encore "HeadlessChrome" dans
+// Sec-CH-UA malgré le correctif ci-dessus, qui ne couvre qu'une navigation SANS redirection. cf.
+// doc d'`applyClientHintsCdpOverride` dans driverBuilder.ts pour les techniques essayées et
+// écartées (dont une qui corrigeait l'en-tête mais cassait l'empreinte TLS/JA3).
+test('en-tête HTTP Sec-CH-UA: survit à une redirection HTTP (cas x.com)', async () => {
+  let capturedHeaders: http.IncomingHttpHeaders | null = null;
+  const server = http.createServer((req, res) => {
+    if (req.url === '/start') {
+      res.writeHead(302, { Location: '/target' });
+      res.end();
+      return;
+    }
+    capturedHeaders = req.headers;
+    res.writeHead(200, { 'Content-Type': 'text/html' });
+    res.end('<!doctype html><html><body>ok</body></html>');
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
+  const address = server.address();
+  if (address === null || typeof address === 'string') throw new Error('adresse de serveur HTTP inattendue');
+
+  const builder = new DriverBuilder({ baseProfileDir: makeTempProfileRoot(), headless: true, maxRetries: 1 });
+  const driver = await builder.build();
+  try {
+    await driver.page.goto(`http://127.0.0.1:${address.port}/start`, { waitUntil: 'domcontentloaded', timeout: 20000 });
+    assert.match(driver.page.url(), /\/target$/, 'la page doit bien suivre la redirection jusqu\'à /target');
+    assert.ok(capturedHeaders, 'le serveur local doit avoir reçu la requête redirigée');
+    const secChUa = capturedHeaders!['sec-ch-ua'];
+    assert.ok(secChUa, 'Sec-CH-UA doit être envoyé par défaut par Chromium');
+    assert.doesNotMatch(secChUa as string, /Headless/i);
+    assert.match(secChUa as string, /Google Chrome/);
+  } finally {
+    await DriverBuilder.quit(driver.context);
+    await new Promise<void>((resolve) => server.close(() => resolve()));
+  }
+});
+
+// Découvert à l'oeil nu en utilisant un profil manuellement (chrome://version) : sans
+// `channel: 'chrome'` dans `build()`, Playwright lance son propre Chromium embarqué, qui
+// s'identifie littéralement "Google Chrome for Testing" — un build distribué par Google pour
+// l'automatisation/CI, jamais pour un usage humain, avec des composants retirés (Widevine/DRM
+// notamment — a fait planter la lecture YouTube). Visible à l'oeil sur `chrome://version`, et
+// potentiellement par des services Google eux-mêmes (reCAPTCHA plus agressif constaté sur la
+// même session, sur le même profil).
+test('build(): lance le VRAI Google Chrome, jamais le build "for Testing" embarqué par Playwright', async () => {
+  const builder = new DriverBuilder({ baseProfileDir: makeTempProfileRoot(), headless: true, maxRetries: 1 });
+  const driver = await builder.build();
+  try {
+    await driver.page.goto('chrome://version', { timeout: 15000 });
+    const text = await mainWorldEvaluate(driver.page, () => document.body.innerText, 'chromium');
+    assert.match(text, /Google Chrome\t/, 'doit afficher "Google Chrome", pas une variante');
+    assert.doesNotMatch(text, /for Testing/i);
+  } finally {
+    await DriverBuilder.quit(driver.context);
+  }
+});
+
+// Découvert en utilisant un profil 'desktop' à la main : redimensionner la fenêtre ne changeait
+// RIEN à ce que la page voit (viewport figé par l'émulation CDP de Playwright, indépendante de
+// la vraie fenêtre) — un vrai navigateur, lui, suit toujours sa fenêtre réelle. cf. doc de
+// `pickDeviceConfig` (`viewport: null` + `--window-size`).
+test('build(): le viewport d\'un profil desktop suit un vrai redimensionnement de fenêtre (pas figé par Playwright)', async () => {
+  const builder = new DriverBuilder({ baseProfileDir: makeTempProfileRoot(), headless: true, maxRetries: 1 });
+  const driver = await builder.build();
+  try {
+    await driver.page.goto('https://example.com', { waitUntil: 'domcontentloaded', timeout: 20000 });
+    const before = await mainWorldEvaluate(driver.page, () => ({ w: window.innerWidth, h: window.innerHeight }), 'chromium');
+
+    const cdp = await driver.context.newCDPSession(driver.page);
+    const { windowId } = await cdp.send('Browser.getWindowForTarget');
+    await cdp.send('Browser.setWindowBounds', { windowId, bounds: { width: 900, height: 600 } });
+    await driver.page.waitForTimeout(500);
+
+    const after = await mainWorldEvaluate(driver.page, () => ({ w: window.innerWidth, h: window.innerHeight }), 'chromium');
+    assert.notDeepEqual(after, before, 'le viewport doit changer suite au redimensionnement de la fenêtre');
+  } finally {
+    await DriverBuilder.quit(driver.context);
   }
 });
