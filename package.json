@@ -1,7 +1,7 @@
 {
   "name": "smonster",
   "version": "1.0.0",
-  "main": "index.js",
+  "main": "dist-electron/electron/main/index.js",
   "scripts": {
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "build": "tsc -p tsconfig.json && node scripts/copy-assets.js",
@@ -12,12 +12,15 @@
     "create-super-admin": "npm run build && node dist/server/scripts/createSuperAdmin.js",
     "build:electron": "tsc -p tsconfig.electron.json && node scripts/copy-assets.js",
     "typecheck:electron": "tsc --noEmit -p tsconfig.electron.json",
-    "electron:dev": "npm run build:electron && electron dist-electron/electron/main/index.js"
+    "electron:dev": "npm run build:electron && electron dist-electron/electron/main/index.js",
+    "package:linux": "npm run build:electron && electron-builder --linux",
+    "package:win": "npm run build:electron && electron-builder --win"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
-  "description": "",
+  "description": "Gestionnaire de profils de navigateur furtifs, en équipe",
+  "homepage": "https://smonster.tlposta.com",
   "dependencies": {
     "argon2": "^0.45.1",
     "better-sqlite3": "^12.11.1",
@@ -28,6 +31,7 @@
     "playwright": "^1.63.0",
     "qrcode": "^1.5.4",
     "socket.io": "^4.8.4",
+    "socket.io-client": "^4.8.4",
     "tar": "^7.5.22"
   },
   "devDependencies": {
@@ -39,7 +43,7 @@
     "@types/qrcode": "^1.5.6",
     "@types/tar": "^6.1.13",
     "electron": "^45.2.0",
-    "socket.io-client": "^4.8.4",
+    "electron-builder": "^26.18.0",
     "typescript": "^5.9.3"
   }
 }

@@ -1,0 +1,56 @@
+appId: com.tlposta.smonster
+productName: smonster
+directories:
+  output: release
+
+# Aucune des dépendances RÉELLEMENT utilisées côté client (patchright/playwright, socket.io-client,
+# tar — cf. `files` plus bas) n'a de binding natif Node à recompiler pour l'ABI d'Electron ; le
+# rebuild automatique d'electron-builder tentait quand même de recompiler `argon2`/`better-sqlite3`
+# (natifs, mais purement serveur, jamais embarqués) et échouait faute de réseau pour leurs
+# binaires précompilés. Désactivé : rien à reconstruire pour ce que l'app embarque vraiment.
+npmRebuild: false
+
+# `dist-electron/**` est compilé depuis `electron/**` + `app/driverBuilder.ts`/`driverPool.ts`/
+# `proxyRotator.ts` UNIQUEMENT (cf. tsconfig.electron.json `include`) — le code serveur
+# (`app/server/**`, secrets JWT, accès DB, hashing de mots de passe) n'y entre jamais, donc ne
+# peut jamais se retrouver embarqué dans un installeur distribué à des clients.
+files:
+  - dist-electron/**/*
+  - package.json
+  # Dépendances RÉELLEMENT utilisées par le process main Electron (cf. audit des imports de
+  # electron/main/**, electron/preload/** et du moteur stealth) : patchright/playwright (lancement
+  # du navigateur), socket.io-client (présence temps réel), tar (empaquetage de l'état d'un
+  # profil). Tout le reste de `dependencies` (argon2, better-sqlite3, express, jsonwebtoken,
+  # nodemailer, qrcode, socket.io) n'existe que pour le BACKEND cloud (app/server/**, jamais
+  # importé ici) — exclu explicitement : certains sont des modules natifs (better-sqlite3, argon2)
+  # qui demanderaient un rebuild pour l'ABI Electron pour rien, puisque le client ne les charge
+  # jamais.
+  - '!node_modules/argon2/**'
+  - '!node_modules/better-sqlite3/**'
+  - '!node_modules/express/**'
+  - '!node_modules/jsonwebtoken/**'
+  - '!node_modules/nodemailer/**'
+  - '!node_modules/qrcode/**'
+  - '!node_modules/socket.io/**'
+  - '!node_modules/@types/**'
+  - '!node_modules/typescript/**'
+  - '!node_modules/electron-builder/**'
+  - '!node_modules/electron/**'
+
+linux:
+  target:
+    - AppImage
+    - deb
+  category: Network
+  maintainer: smonster
+
+deb:
+  depends:
+    - libnotify4
+    - libxtst6
+    - libnss3
+
+win:
+  target:
+    - nsis
+    - portable
