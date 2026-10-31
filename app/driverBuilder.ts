@@ -1650,6 +1650,15 @@ export interface DriverBuilderOptions {
    * fermeture normale. C'est à l'appelant de le supprimer explicitement s'il veut s'en défaire.
    */
   profileDir?: string;
+  /**
+   * Dossiers d'extensions non empaquetées (format "unpacked", un dossier par extension - pas de
+   * `.crx`) à charger au démarrage. Chromium uniquement : ignoré sur WebKit (API absente, cf.
+   * `build()` - `--load-extension`/`--disable-extensions-except` ne sont ajoutés qu'à
+   * `engineArgs`, déjà scopé à `engine === 'chromium'`). Toujours une liste LOCALE à la machine
+   * (jamais synchronisée vers le cloud, cf. `electron/main/extensionsStore.ts`) : un chemin de
+   * dossier n'a de sens que sur la machine qui l'a choisi.
+   */
+  extensionPaths?: string[];
 }
 
 export interface BuiltDriver {
@@ -1768,11 +1777,14 @@ async function getDesktopUserAgent(platform: 'windows' | 'macos' | 'linux'): Pro
  * annoncé par le JS à l'heure dérivée de la géolocalisation de l'IP et signale l'écart — un vrai
  * utilisateur n'a quasiment jamais un fuseau différent de sa position réseau réelle.
  *
- * Résout le fuseau IANA (ex. `"Africa/Porto-Novo"`) correspondant à l'IP de SORTIE du proxy
- * fourni, via l'API gratuite ip-api.com, elle-même appelée à TRAVERS ce proxy (sinon on
- * géolocaliserait notre propre IP, pas celle que verra le site cible). Best-effort : `null` en
- * cas d'échec (API injoignable, proxy mort, timeout, réponse inattendue) — jamais fatal, cf.
- * l'appelant dans `build()`, qui retombe alors sur `this.timezoneId` (défaut ou valeur fournie).
+ * Résout le fuseau IANA, le pays et les coordonnées approximatives correspondant à l'IP de
+ * SORTIE du proxy fourni, via l'API gratuite ip-api.com, elle-même appelée à TRAVERS ce proxy
+ * (sinon on géolocaliserait notre propre IP, pas celle que verra le site cible). Best-effort :
+ * `null` en cas d'échec (API injoignable, proxy mort, timeout, réponse inattendue) — jamais
+ * fatal, cf. l'appelant dans `build()`, qui retombe alors sur les valeurs par défaut/fournies.
+ *
+ * Un seul appel réseau pour fuseau + pays + coordonnées (pas un appel par info) : `ip-api.com`
+ * les renvoie tous dans la même réponse, inutile de le solliciter trois fois pour la même IP.
  *
  * Passe par un vrai navigateur headless jetable (`chromium.launch`) plutôt que
  * `request.newContext()` (le client HTTP léger de Playwright, indépendant d'un vrai processus
@@ -1782,7 +1794,23 @@ async function getDesktopUserAgent(platform: 'windows' | 'macos' | 'linux'): Pro
  * robuste ici, en plus de reproduire fidèlement la même sémantique réseau/proxy que le contexte
  * final.
  */
-async function resolveTimezoneFromProxy(proxy: ProxyConfig): Promise<string | null> {
+export interface ProxyGeo {
+  ip: string | null;
+  timezone: string | null;
+  countryCode: string | null;
+  country: string | null;
+  region: string | null;
+  city: string | null;
+  zip: string | null;
+  lat: number | null;
+  lon: number | null;
+}
+
+/** Exportée (cf. `electron/main/profileManager.ts`, bouton "Vérifier le proxy" côté UI) - même
+ * résolution que celle utilisée pour l'auto-détection fuseau/locale, réutilisée telle quelle
+ * plutôt que dupliquée : un IP/pays/ville/coordonnées valent la peine d'être montrés à
+ * l'utilisateur quand il teste un proxy, pas seulement consommés en interne. */
+export async function resolveGeoFromProxy(proxy: ProxyConfig): Promise<ProxyGeo | null> {
   let browser: Browser | undefined;
   try {
     browser = await chromium.launch({
@@ -1790,19 +1818,65 @@ async function resolveTimezoneFromProxy(proxy: ProxyConfig): Promise<string | nu
       proxy: { server: proxy.server, username: proxy.username, password: proxy.password },
     });
     const page = await browser.newPage();
-    await page.goto('http://ip-api.com/json/?fields=status,timezone', { timeout: 8000 });
+    await page.goto('http://ip-api.com/json/?fields=status,timezone,countryCode,country,regionName,city,zip,lat,lon,query', { timeout: 8000 });
     const text = await page.evaluate(() => document.body.innerText);
-    const data = JSON.parse(text) as { status?: string; timezone?: string };
-    if (data.status === 'success' && typeof data.timezone === 'string' && data.timezone) {
-      return data.timezone;
-    }
-    return null;
+    const data = JSON.parse(text) as {
+      status?: string;
+      timezone?: string;
+      countryCode?: string;
+      country?: string;
+      regionName?: string;
+      city?: string;
+      zip?: string;
+      lat?: number;
+      lon?: number;
+      query?: string;
+    };
+    if (data.status !== 'success') return null;
+    const str = (v: unknown): string | null => (typeof v === 'string' && v ? v : null);
+    return {
+      ip: str(data.query),
+      timezone: str(data.timezone),
+      countryCode: str(data.countryCode),
+      country: str(data.country),
+      region: str(data.regionName),
+      city: str(data.city),
+      zip: str(data.zip),
+      lat: typeof data.lat === 'number' ? data.lat : null,
+      lon: typeof data.lon === 'number' ? data.lon : null,
+    };
   } catch {
     return null;
   } finally {
     await browser?.close().catch(() => {});
   }
 }
+
+/**
+ * Pays (code ISO 3166-1 alpha-2 renvoyé par ip-api.com) -> locale correspondante. Limitée aux
+ * locales déjà proposées dans l'UI (cf. `LOCALE_PRESETS`, `electron/renderer/shared.js`) :
+ * mieux vaut ne PAS deviner de locale pour un pays absent de cette liste (garder la valeur
+ * fournie/par défaut) que d'en inventer une approximative et potentiellement fausse.
+ */
+const COUNTRY_CODE_TO_LOCALE: Record<string, string> = {
+  FR: 'fr-FR',
+  US: 'en-US',
+  GB: 'en-GB',
+  DE: 'de-DE',
+  ES: 'es-ES',
+  IT: 'it-IT',
+  BR: 'pt-BR',
+  PT: 'pt-PT',
+  NL: 'nl-NL',
+  PL: 'pl-PL',
+  RU: 'ru-RU',
+  JP: 'ja-JP',
+  KR: 'ko-KR',
+  CN: 'zh-CN',
+  TW: 'zh-TW',
+  SA: 'ar-SA',
+  TR: 'tr-TR',
+};
 
 export class DriverBuilder {
   private baseProfileDir: string;
@@ -1817,10 +1891,12 @@ export class DriverBuilder {
   private locale: string;
   private timezoneId: string;
   // Distingue "valeur par défaut" de "fournie explicitement par l'appelant" : sert à ne
-  // déclencher la détection auto du fuseau via le proxy (cf. `resolveTimezoneFromProxy`) que
-  // lorsque l'appelant n'a PAS déjà choisi un `timezoneId` lui-même, pour ne jamais écraser une
+  // déclencher la détection auto du fuseau/de la locale via le proxy (cf. `resolveGeoFromProxy`)
+  // que lorsque l'appelant n'a PAS déjà choisi la valeur lui-même, pour ne jamais écraser une
   // intention explicite.
   private timezoneIdExplicit: boolean;
+  private localeExplicit: boolean;
+  private extensionPaths: string[];
 
   constructor(opts: DriverBuilderOptions = {}) {
     if (opts.proxy && opts.proxyRotator) {
@@ -1838,6 +1914,8 @@ export class DriverBuilder {
     this.locale = opts.locale ?? 'fr-FR';
     this.timezoneId = opts.timezoneId ?? 'Europe/Paris';
     this.timezoneIdExplicit = opts.timezoneId !== undefined;
+    this.localeExplicit = opts.locale !== undefined;
+    this.extensionPaths = opts.extensionPaths ?? [];
 
     // Inutile de préparer un dossier de base éphémère si on ne s'en servira jamais (chemin
     // fixe fourni).
@@ -1931,6 +2009,33 @@ export class DriverBuilder {
         const launcher = engine === 'webkit' ? webkit : chromium;
         proxy = this.proxyRotator ? this.proxyRotator.next(this.proxyStickyKey) : this.proxy;
 
+        // Résolu ICI (avant `engineArgs`, qui a besoin de la locale finale pour `--lang=`) plutôt
+        // que juste avant `launchPersistentContext` comme avant : fuseau/locale/géoloc viennent
+        // tous les trois du même appel à `resolveGeoFromProxy`, un seul aller-retour réseau par
+        // lancement. Seulement si un proxy est utilisé ET que l'appelant n'a pas déjà choisi la
+        // valeur lui-même — jamais question d'écraser un choix explicite (cf. `timezoneIdExplicit`/
+        // `localeExplicit`).
+        let timezoneId = this.timezoneId;
+        let locale = this.locale;
+        let geolocation: { latitude: number; longitude: number; accuracy: number } | undefined;
+        if (proxy && (!this.timezoneIdExplicit || !this.localeExplicit)) {
+          const geo = await resolveGeoFromProxy(proxy);
+          if (geo) {
+            if (!this.timezoneIdExplicit && geo.timezone) timezoneId = geo.timezone;
+            if (!this.localeExplicit && geo.countryCode && COUNTRY_CODE_TO_LOCALE[geo.countryCode]) {
+              locale = COUNTRY_CODE_TO_LOCALE[geo.countryCode];
+            }
+            // Accordée seulement quand elle est effectivement cohérente avec l'IP de sortie
+            // (cf. doc de `resolveGeoFromProxy`) — jamais une position par défaut arbitraire.
+            // `accuracy` large (50 km) : ip-api.com donne un centroïde ville, pas un relevé GPS,
+            // une précision "exacte" serait elle-même un signal incohérent avec une IP résidentielle/
+            // datacenter classique.
+            if (geo.lat !== null && geo.lon !== null) {
+              geolocation = { latitude: geo.lat, longitude: geo.lon, accuracy: 50000 };
+            }
+          }
+        }
+
         // Les flags `--no-sandbox` / `--disable-blink-features=...` sont spécifiques à
         // Chromium (sandboxing et flags Blink) : inutiles sur WebKit, et leur effet sur ce
         // moteur n'est pas garanti, donc on ne les envoie que pour Chromium.
@@ -1955,7 +2060,7 @@ export class DriverBuilder {
                   '--disable-blink-features=AutomationControlled',
                   '--no-first-run',
                   '--no-default-browser-check',
-                  `--lang=${this.locale}`,
+                  `--lang=${locale}`,
                   // Empêche WebRTC d'utiliser de l'UDP non-proxifié pour la découverte ICE : sans
                   // ça, un candidat srflx (IP publique via STUN, en UDP direct) contournerait
                   // n'importe quel proxy HTTP/SOCKS configuré par ailleurs. Défense native
@@ -1967,6 +2072,13 @@ export class DriverBuilder {
                   // fenêtre, redimensionnable comme chez un vrai utilisateur. Absent pour un
                   // preset device (mobile/tablette), qui garde son viewport fixe intentionnel.
                   ...(windowSize ? [`--window-size=${windowSize.width},${windowSize.height}`] : []),
+                  // Extensions non empaquetées (cf. doc de `extensionPaths`) : les deux flags
+                  // doivent lister EXACTEMENT les mêmes chemins - `--disable-extensions-except`
+                  // sans `--load-extension` assorti désactiverait celles qu'on vient de charger,
+                  // pas juste le reste.
+                  ...(this.extensionPaths.length > 0
+                    ? [`--disable-extensions-except=${this.extensionPaths.join(',')}`, `--load-extension=${this.extensionPaths.join(',')}`]
+                    : []),
                   // Découvert via bot-detector.rebrowser.net ("storagePartitioning") : Playwright
                   // désactive par défaut le partitionnement de stockage tiers
                   // (`--disable-features=...ThirdPartyStoragePartitioning...`), ce qui permet à
@@ -2009,15 +2121,6 @@ export class DriverBuilder {
               }
             : {};
 
-        // Fuseau horaire aligné sur la sortie réelle du proxy (cf. doc de
-        // `resolveTimezoneFromProxy`) : seulement si un proxy est utilisé ET que l'appelant n'a
-        // pas déjà choisi `timezoneId` lui-même — jamais question d'écraser un choix explicite.
-        let timezoneId = this.timezoneId;
-        if (proxy && !this.timezoneIdExplicit) {
-          const detected = await resolveTimezoneFromProxy(proxy);
-          if (detected) timezoneId = detected;
-        }
-
         // launchPersistentContext = profil isolé sur disque, comme --user-data-dir
         // Cast `BrowserContext` : cf. commentaire sur l'import de `Browser`/`BrowserContext`/`Page`
         // plus haut — `launcher` peut être soit `chromium` (patchright-core) soit `webkit`
@@ -2025,8 +2128,12 @@ export class DriverBuilder {
         // qu'identiques à l'exécution (même protocole CDP/pipe, même shape runtime).
         context = (await launcher.launchPersistentContext(profileDir, {
           headless: this.headless,
-          locale: this.locale,
+          locale,
           timezoneId,
+          // `permissions: ['geolocation']` seulement quand `geolocation` est lui-même défini (donc
+          // réellement résolu depuis l'IP du proxy, cf. plus haut) : jamais de permission accordée
+          // sans coordonnées cohérentes à donner derrière.
+          ...(geolocation ? { geolocation, permissions: ['geolocation'] } : {}),
           ...(proxy ? { proxy } : {}),
           ...deviceConfig,
           ...engineArgs,
@@ -2053,7 +2160,7 @@ export class DriverBuilder {
         // incohérences trouvées en testant contre bot.sannysoft.com/CreepJS sur un vrai profil.
         await context.addInitScript(applyNavigatorOverrides, {
           platform: PLATFORM_STRINGS[platformCategory],
-          languages: deriveLanguages(this.locale),
+          languages: deriveLanguages(locale),
         });
 
         // Client Hints (cf. doc de `applyClientHintsOverride`) : Chromium seulement, l'API

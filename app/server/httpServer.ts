@@ -1,46 +1,69 @@
 import express from 'express';
 import type { NextFunction, Request, Response } from 'express';
-import * as path from 'path';
-import { ProfileManager, ProfileNotFoundError } from '../profileManager';
-import { detectHostPlatformCategory } from '../driverBuilder';
-import { createProfilesRouter } from './profilesRouter';
+import type { UserRepository } from './db/users';
+import type { TeamRepository } from './db/teams';
+import type { ProxyRepository } from './db/proxies';
+import type { ProfileRepository } from './db/profiles';
+import type { RefreshTokenRepository } from './db/refreshTokens';
+import type { EmailCodeRepository } from './db/emailCodes';
+import type { ProfileStateStore } from './profileState';
+import type { PresenceTracker } from './ws/presence';
+import { createAuthRouter } from './routes/authRouter';
+import { createAccountRouter } from './routes/accountRouter';
+import { createTeamsRouter } from './routes/teamsRouter';
+import { createProxiesRouter } from './routes/proxiesRouter';
+import { createProfilesRouter } from './routes/profilesRouter';
+import { UnauthorizedError, ForbiddenError } from './auth/middleware';
 
-export interface CreateAppOptions {
-  /**
-   * Dossier des fichiers statiques du dashboard. Par défaut, le dossier `public/` à la racine
-   * du repo (résolu depuis le fichier compilé, PAS copié dans `dist/` — `public/` ne contient
-   * aucun `.ts`, donc `tsconfig.json` n'a rien à en faire).
-   */
-  publicDir?: string;
+export interface AppDeps {
+  users: UserRepository;
+  teams: TeamRepository;
+  proxies: ProxyRepository;
+  profiles: ProfileRepository;
+  refreshTokens: RefreshTokenRepository;
+  emailCodes: EmailCodeRepository;
+  state: ProfileStateStore;
+  presence: PresenceTracker;
+  dataDir: string;
 }
 
-export function createApp(manager: ProfileManager, opts: CreateAppOptions = {}) {
+/**
+ * Backend cloud smonster : auth + teams/membres/permissions + catalogue partagé (profils/
+ * proxys) + état des profils. Ne sert plus de dashboard statique (`public/`) — c'est Electron
+ * (phase C) qui charge l'UI directement, le cloud n'est qu'une API + WebSocket (cf. plan).
+ */
+export function createApp(deps: AppDeps) {
   const app = express();
+  // `express.json()` ignore les requêtes dont le Content-Type ne correspond pas (ex.
+  // `application/gzip` sur `PUT .../profiles/:id/state`, qui a son propre middleware `raw()`
+  // scoped à cette seule route dans profilesRouter.ts) — pas de conflit entre les deux.
   app.use(express.json());
 
-  const publicDir = opts.publicDir ?? path.join(__dirname, '..', '..', 'public');
-  app.use(express.static(publicDir));
-
-  // Expose au dashboard le système que le device 'desktop' va réellement claim sur CETTE machine
-  // (cf. `detectHostPlatformCategory` dans driverBuilder.ts) : auparavant, rien dans l'UI
-  // n'indiquait quel OS un profil "desktop" allait prétendre être — invisible pour la personne qui
-  // crée le profil. Les autres presets (iPhone 15, Pixel 7...) n'ont pas besoin de cet endpoint :
-  // leur plateforme est déjà évidente dans leur nom, ce sont des émulations figées, pas détectées.
-  app.get('/api/host-info', (_req: Request, res: Response) => {
-    res.json({ desktopPlatform: detectHostPlatformCategory() });
-  });
-
-  app.use('/api/profiles', createProfilesRouter(manager));
+  app.use(
+    '/api/auth',
+    createAuthRouter({ users: deps.users, teams: deps.teams, refreshTokens: deps.refreshTokens, emailCodes: deps.emailCodes, dataDir: deps.dataDir })
+  );
+  app.use('/api/account', createAccountRouter({ users: deps.users }));
+  app.use('/api/teams', createTeamsRouter({ teams: deps.teams, profiles: deps.profiles, state: deps.state }));
+  app.use('/api/teams/:teamId/proxies', createProxiesRouter(deps.proxies, deps.teams));
+  app.use(
+    '/api/teams/:teamId/profiles',
+    createProfilesRouter({ profiles: deps.profiles, teams: deps.teams, state: deps.state, presence: deps.presence })
+  );
 
   // Middleware d'erreur central (signature à 4 arguments requise par Express pour être reconnu
-  // comme tel) : mappe ProfileNotFoundError en 404, tout le reste en 500.
+  // comme tel) : mappe les erreurs connues en codes HTTP, tout le reste en 500.
   app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
-    if (err instanceof ProfileNotFoundError) {
-      res.status(404).json({ error: err.message });
+    if (err instanceof UnauthorizedError) {
+      res.status(401).json({ error: err.message });
+      return;
+    }
+    if (err instanceof ForbiddenError) {
+      res.status(403).json({ error: err.message });
       return;
     }
     const message = err instanceof Error ? err.message : String(err);
-    console.error('Erreur non gérée sur une requête du dashboard:', err);
+    console.error('Erreur non gérée sur une requête du backend:', err);
     res.status(500).json({ error: message });
   });
 
